@@ -1,13 +1,37 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import webbrowser
+from pathlib import Path
 
 import uvicorn
+
+
+def repository_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def frontend_dir() -> Path:
+    candidates = [repository_root() / "frontend", Path.cwd() / "frontend"]
+    for candidate in candidates:
+        if (candidate / "package.json").exists():
+            return candidate
+    return candidates[0]
+
+
+def resolve_npm() -> str | None:
+    names = ["npm.cmd", "npm"] if os.name == "nt" else ["npm"]
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
 
 
 def main() -> None:
@@ -21,7 +45,15 @@ def main() -> None:
 
     frontend_proc: subprocess.Popen[bytes] | None = None
     if args.start_frontend:
-        frontend_proc = subprocess.Popen(["npm", "run", "dev"], cwd="frontend")
+        npm = resolve_npm()
+        if npm is None:
+            print("npm was not found. Install Node.js LTS, then run setup_windows.ps1.", file=sys.stderr)
+            raise SystemExit(1)
+        front = frontend_dir()
+        if not (front / "node_modules").exists():
+            print("frontend/node_modules not found. Run setup_windows.ps1 or cd frontend; npm install", file=sys.stderr)
+            raise SystemExit(1)
+        frontend_proc = subprocess.Popen([npm, "run", "dev"], cwd=front)
 
     if not args.no_browser:
         threading.Thread(target=lambda: (time.sleep(1.0), webbrowser.open(args.frontend_url)), daemon=True).start()

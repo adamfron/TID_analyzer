@@ -14,6 +14,7 @@ class ImportState:
     cache_dir: Path = field(default_factory=lambda: Path(".tid_analyzer_cache"))
     status: dict[str, Any] = field(default_factory=lambda: {"stage": "idle", "current": 0, "total": 0, "message": "Idle"})
     manifest: dict[str, Any] | None = None
+    source_folder: Path | None = None
     queue: asyncio.Queue[dict[str, Any]] = field(default_factory=asyncio.Queue)
     task: asyncio.Task[None] | None = None
 
@@ -30,11 +31,11 @@ class ImportState:
         loop = asyncio.get_running_loop()
 
         def progress(stage: str, current: int, total: int, message: str) -> None:
-            update = {"stage": stage, "current": current, "total": total, "message": message}
-            asyncio.run_coroutine_threadsafe(self.publish(update), loop)
+            asyncio.run_coroutine_threadsafe(self.publish({"stage": stage, "current": current, "total": total, "message": message}), loop)
 
         try:
             manifest = await asyncio.to_thread(build_manifest, folder, self.cache_dir, ImportFilters(), progress)
             self.manifest = manifest
+            self.source_folder = folder
         except Exception as exc:  # noqa: BLE001 - message is surfaced to local UI
             await self.publish({"stage": "error", "current": 0, "total": 0, "message": str(exc)})
