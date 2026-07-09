@@ -1,15 +1,12 @@
 :root { color: #dbe7ff; background: #08111f; font-family: Inter, system-ui, sans-serif; }
-body { margin: 0; }
-.app { height: 100vh; display: grid; grid-template-rows: 48px 1fr 36px; }
-.topbar { display: flex; align-items: center; gap: 12px; padding: 8px 14px; background: #0e1b2e; border-bottom: 1px solid #223656; }
-.topbar input { flex: 1; padding: 8px 10px; border-radius: 6px; border: 1px solid #375073; background: #101d31; color: #fff; }
-button { border: 1px solid #3c5e8f; border-radius: 6px; color: #dbe7ff; background: #173155; padding: 8px 10px; cursor: pointer; }
-button.active { background: #2b65b1; }
-progress { width: 160px; }
-.workspace { min-height: 0; display: grid; grid-template-columns: 1fr 360px; }
-.canvas { padding: 32px; background: radial-gradient(circle at 35% 25%, #19345a, #08111f 55%); }
-.panel { overflow: auto; padding: 14px; border-left: 1px solid #223656; background: #0c1728; }
-.panel nav { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
-.placeholder { color: #8ea7ca; }
-.summary pre { padding: 10px; border-radius: 8px; overflow: auto; background: #07101d; }
-footer { display: flex; align-items: center; padding: 0 14px; border-top: 1px solid #223656; color: #9fb4d3; background: #0e1b2e; }
+body { margin: 0; } .app { height: 100vh; display: grid; grid-template-rows: auto 1fr 36px; }
+.topbar { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: #0e1b2e; border-bottom: 1px solid #223656; flex-wrap: wrap; }
+.topbar input { flex: 1; min-width: 260px; padding: 8px 10px; border-radius: 6px; border: 1px solid #375073; background: #101d31; color: #fff; }
+button, select, .summary input { border: 1px solid #3c5e8f; border-radius: 6px; color: #dbe7ff; background: #173155; padding: 8px 10px; cursor: pointer; }
+button.active { background: #2b65b1; } progress { width: 150px; } .mini { color: #9fc7ff; font-size: 13px; }
+.workspace { min-height: 0; display: grid; grid-template-columns: 1fr 380px; } .canvas { padding: 24px; background: radial-gradient(circle at 35% 25%, #19345a, #08111f 55%); overflow: auto; }
+.panel { overflow: auto; padding: 14px; border-left: 1px solid #223656; background: #0c1728; } .panel nav { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
+.placeholder { color: #8ea7ca; } .summary pre { padding: 10px; border-radius: 8px; overflow: auto; background: #07101d; } .summary label { display: grid; gap: 6px; margin: 10px 0; }
+.warn { padding: 10px; border: 1px solid #b58a22; background: #3a2b08; border-radius: 8px; color: #ffe19b; }
+.plot { max-width: 100%; background: #0d1829; border: 1px solid #29405f; border-radius: 10px; } .plot line { stroke: #29405f; stroke-width: 1; } .plot text { fill: #9fb4d3; font-size: 13px; } .plot circle { stroke: #08111f; stroke-width: 1; }
+.tooltip { color: #c6d8f6; min-height: 24px; } footer { display: flex; align-items: center; padding: 0 14px; border-top: 1px solid #223656; color: #9fb4d3; background: #0e1b2e; }
