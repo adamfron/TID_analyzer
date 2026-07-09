@@ -80,3 +80,76 @@ def test_preview_endpoint_supports_time_h_tolerance() -> None:
     state.source_folder = FIXTURES
     data = TestClient(app).get("/api/preview/points?time_h=0.0&tolerance_seconds=1").json()
     assert data["count_returned"] == 2
+
+
+def test_world_borders_endpoint_returns_geojson() -> None:
+    response = TestClient(app).get("/api/assets/world-borders")
+    assert response.status_code == 200
+    assert response.json()["type"] == "FeatureCollection"
+
+
+def test_visibility_endpoint_returns_arcs() -> None:
+    state.source_folder = FIXTURES
+    data = TestClient(app).get("/api/satellites/visibility").json()
+    assert data["arcs"]
+    assert {arc["prn"] for arc in data["arcs"]} == {"G05", "G12", "G24"}
+
+
+def test_visibility_endpoint_splits_multiple_arcs_by_time_gap(tmp_path: Path) -> None:
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "TEST_2024_246.txt").write_text(
+        "0.0;G24;1;1;80;10;50\n0.05;G24;1;1;80;10;50\n0.4;G24;1;1;80;10;50\n",
+        encoding="utf-8",
+    )
+    state.source_folder = folder
+    data = TestClient(app).get("/api/satellites/visibility?gap_minutes=10").json()
+    arcs = [arc for arc in data["arcs"] if arc["prn"] == "G24"]
+    assert len(arcs) == 2
+    assert arcs[0]["row_count"] == 2
+    assert arcs[1]["arc_index"] == 2
+
+
+def test_preview_endpoint_treats_zero_time_as_valid(tmp_path: Path) -> None:
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "TEST_2024_246.txt").write_text(
+        "0.0;G24;1;1;80;10;50\n1.0;G24;2;1;80;10;50\n",
+        encoding="utf-8",
+    )
+    state.source_folder = folder
+    data = TestClient(app).get("/api/preview/points?prn=G24&time_h=0&tolerance_seconds=1").json()
+    assert data["mode_used"] == "current_epoch"
+    assert data["count_returned"] == 1
+    assert data["points"][0]["time_h"] == 0.0
+
+
+def test_preview_endpoint_supports_start_end_time_window(tmp_path: Path) -> None:
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "TEST_2024_246.txt").write_text(
+        "0.0;G24;1;1;80;10;50\n0.5;G24;2;1;80;10;50\n1.0;G24;3;1;80;10;50\n",
+        encoding="utf-8",
+    )
+    state.source_folder = folder
+    data = TestClient(app).get("/api/preview/points?prn=G24&start_time_h=0.25&end_time_h=0.75").json()
+    assert data["mode_used"] == "selected_time_window"
+    assert [p["time_h"] for p in data["points"]] == [0.5]
+
+
+def test_preview_endpoint_uses_deterministic_sampling(tmp_path: Path) -> None:
+    folder = tmp_path / "day"; folder.mkdir()
+    rows = "".join(f"{i};G24;{i};1;80;10;50\n" for i in range(10))
+    (folder / "TEST_2024_246.txt").write_text(rows, encoding="utf-8")
+    state.source_folder = folder
+    client = TestClient(app)
+    first = client.get("/api/preview/points?prn=G24&max_points=3").json()
+    second = client.get("/api/preview/points?prn=G24&max_points=3").json()
+    assert first == second
+    assert first["limit_reached"] is True
+    assert [p["time_h"] for p in first["points"]] == [0.0, 4.0, 9.0]
+
+
+def test_station_timeseries_endpoint_returns_selected_station_series() -> None:
+    state.source_folder = FIXTURES
+    data = TestClient(app).get("/api/stations/timeseries?station=LAMA&prn=G24").json()
+    assert data["series"][0]["station"] == "LAMA"
+    assert data["series"][0]["prn"] == "G24"
+    assert [p["time_h"] for p in data["series"][0]["points"]] == [0.0]

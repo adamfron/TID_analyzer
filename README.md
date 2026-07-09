@@ -84,3 +84,21 @@ API endpoints:
 - `GET /api/preview/points`
 - `POST /api/select-folder`
 - `WS /ws/import-progress`
+
+## Exploratory workflow
+
+The web workspace now follows a numbered exploratory flow:
+
+1. **Data import & summary** imports a daily station folder and reports parser/filter metadata.
+2. **Satellite visibility** groups filtered GPS observations into per-PRN visibility arcs, splitting arcs on configurable time gaps.
+3. **Map explorer** draws a lightweight lon/lat SVG map with bundled world borders under IPP points. Modes include current epoch, whole selected satellite, and selected time window. Current-epoch requests explicitly preserve `time_h=0`.
+4. **Station time series** lets map clicks select station/PRN pairs and overlays selected vertical dTEC series.
+5. **Spectral analysis**, **TID candidates**, and **Event report** are placeholders for later FFT/wavelet, detection, tracking, and export work.
+
+Useful API endpoints for this stage:
+
+- `GET /api/assets/world-borders`
+- `GET /api/satellites/visibility?gap_minutes=10`
+- `GET /api/preview/points?prn=G24&time_h=0&tolerance_seconds=15`
+- `GET /api/preview/points?prn=G24&start_time_h=1&end_time_h=2`
+- `GET /api/stations/timeseries?station=LAMA&station=GWWL&prn=G24`
