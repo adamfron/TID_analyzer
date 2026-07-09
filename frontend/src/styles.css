@@ -1,0 +1,15 @@
+:root { color: #dbe7ff; background: #08111f; font-family: Inter, system-ui, sans-serif; }
+body { margin: 0; }
+.app { height: 100vh; display: grid; grid-template-rows: 48px 1fr 36px; }
+.topbar { display: flex; align-items: center; gap: 12px; padding: 8px 14px; background: #0e1b2e; border-bottom: 1px solid #223656; }
+.topbar input { flex: 1; padding: 8px 10px; border-radius: 6px; border: 1px solid #375073; background: #101d31; color: #fff; }
+button { border: 1px solid #3c5e8f; border-radius: 6px; color: #dbe7ff; background: #173155; padding: 8px 10px; cursor: pointer; }
+button.active { background: #2b65b1; }
+progress { width: 160px; }
+.workspace { min-height: 0; display: grid; grid-template-columns: 1fr 360px; }
+.canvas { padding: 32px; background: radial-gradient(circle at 35% 25%, #19345a, #08111f 55%); }
+.panel { overflow: auto; padding: 14px; border-left: 1px solid #223656; background: #0c1728; }
+.panel nav { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
+.placeholder { color: #8ea7ca; }
+.summary pre { padding: 10px; border-radius: 8px; overflow: auto; background: #07101d; }
+footer { display: flex; align-items: center; padding: 0 14px; border-top: 1px solid #223656; color: #9fb4d3; background: #0e1b2e; }

@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.tid_analyzer_cache/
+node_modules/
+frontend/dist/
+.DS_Store
