@@ -57,7 +57,7 @@ tbody tr:hover { background:#e4eef8; }
 .plot text { fill: #40556e; font-size: 13px; font-weight: 600; }
 .plot circle { stroke-width: 1.4; cursor:pointer; filter: drop-shadow(0 1px 1px rgba(42,52,65,.18)); }
 .plot circle:hover { stroke-width: 2.2; }
-.borders path { fill:none; stroke:#8f9aa8; stroke-width:1.05; opacity:.82; pointer-events:none; }
+.borders path { fill:none; stroke:#8f9aa8; stroke-width:.8; opacity:.82; pointer-events:none; }
 .tooltip { color: #31445c; min-height: 22px; margin: 8px 0 0; }
 .series { width:100%; margin-top:10px; background:#fff; border:1px solid #c2cfdf; border-radius:8px; }
 .line { fill:none; stroke-width:2; cursor:pointer; }
