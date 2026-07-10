@@ -76,10 +76,16 @@ def test_preview_endpoint_supports_prn_filter() -> None:
     assert data["points"][0]["prn"] == "G12"
 
 
-def test_preview_endpoint_supports_time_h_tolerance() -> None:
+def test_preview_endpoint_snaps_current_epoch_to_nearest_available_time() -> None:
     state.source_folder = FIXTURES
-    data = TestClient(app).get("/api/preview/points?time_h=0.0&tolerance_seconds=1").json()
-    assert data["count_returned"] == 2
+    data = TestClient(app).get("/api/preview/points?prn=G24&time_h=0.02&tolerance_seconds=1").json()
+    assert data["mode_used"] == "current_epoch"
+    assert data["requested_time_h"] == 0.02
+    assert data["actual_time_h"] == 0.0
+    assert data["count_returned"] == 1
+    assert data["station_markers"] == [{"station": "LAMA", "lon": 19.5, "lat": 50.1, "approximate": True, "source": "mean_epoch_ipp"}]
+    assert data["raster_available"] is False
+    assert data["interpolated_dtec"] is None
 
 
 def test_world_borders_endpoint_returns_geojson() -> None:
