@@ -196,3 +196,51 @@ def test_map_epoch_endpoint_snaps_and_returns_points(tmp_path: Path) -> None:
     assert data["count"] == 1
     assert data["stations"] == ["TEST"]
     assert data["points"][0]["dtec"] == 2.0
+
+
+def _spectral_folder(tmp_path: Path) -> Path:
+    folder = tmp_path / "spectral_day"; folder.mkdir()
+    rows = []
+    for i in range(64):
+        t = i / 120  # 30-second cadence in hours.
+        rows.append(f"{t:.10f};G24;{__import__('math').sin(i/4):.6f};120;70;20;50\n")
+    (folder / "LAMA_2024_246.txt").write_text("".join(rows), encoding="utf-8")
+    return folder
+
+
+def test_fft_endpoint_returns_period_and_amplitude_arrays(tmp_path: Path) -> None:
+    folder = _spectral_folder(tmp_path)
+    manifest = build_manifest(folder, tmp_path / "cache")
+    state.source_folder = folder
+    state.manifest = manifest
+    state.cache_path = Path(str(manifest["cache_path"]))
+    data = TestClient(app).post("/api/spectral/fft", json={"station": "LAMA", "prn": "G24"}).json()
+    assert data["station"] == "LAMA"
+    assert data["prn"] == "G24"
+    assert len(data["period_min"]) == len(data["amplitude"])
+    assert data["period_min"]
+
+
+def test_morlet_endpoint_returns_time_period_power_arrays(tmp_path: Path) -> None:
+    folder = _spectral_folder(tmp_path)
+    manifest = build_manifest(folder, tmp_path / "cache")
+    state.source_folder = folder
+    state.manifest = manifest
+    state.cache_path = Path(str(manifest["cache_path"]))
+    data = TestClient(app).post("/api/spectral/morlet", json={"station": "LAMA", "prn": "G24", "period_min_min": 2, "period_min_max": 30}).json()
+    assert data["time_h"]
+    assert data["period_min"]
+    assert len(data["power"]) == len(data["period_min"])
+    assert len(data["power"][0]) == len(data["time_h"])
+
+
+def test_spectral_endpoint_reports_short_series(tmp_path: Path) -> None:
+    folder = tmp_path / "short_day"; folder.mkdir()
+    (folder / "LAMA_2024_246.txt").write_text("0;G24;1;120;70;20;50\n0.01;G24;2;120;70;20;50\n", encoding="utf-8")
+    manifest = build_manifest(folder, tmp_path / "cache")
+    state.source_folder = folder
+    state.manifest = manifest
+    state.cache_path = Path(str(manifest["cache_path"]))
+    response = TestClient(app).post("/api/spectral/fft", json={"station": "LAMA", "prn": "G24"})
+    assert response.status_code == 400
+    assert "At least four observations" in response.json()["detail"]

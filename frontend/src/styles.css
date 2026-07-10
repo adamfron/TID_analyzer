@@ -88,3 +88,11 @@ summary { cursor: pointer; color: #2f435b; font-weight: 700; }
 .mapModal { width: min(1180px, 96vw); height: min(860px, 92vh); display: flex; flex-direction: column; gap: 10px; padding: 14px; border-radius: 12px; background: #f8fbff; box-shadow: 0 24px 80px rgba(0,0,0,.35); }
 .mapModal .plot { flex: 1; min-height: 0; }
 .close { align-self: flex-end; }
+.selectedChips { display:flex; flex-wrap:wrap; gap:6px; }
+.legend { cursor:pointer; }
+.legend text { font-size: 11px; fill: #344963; }
+.series line { stroke:#d1d9e3; stroke-width:1; }
+.series text { fill:#40556e; font-size:11px; font-weight:600; }
+.seriesLarge { min-height: 460px; }
+.modalPlot { overflow:auto; }
+.modalPlot h2 { margin:0; color:#24364b; }

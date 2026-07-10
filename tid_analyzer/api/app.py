@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from typing import Any
+
+import numpy as np
 from importlib import resources
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+try:
+    import pywt
+except ImportError:  # pragma: no cover - dependency is declared for runtime installs.
+    pywt = None
 
 from tid_analyzer.config import ImportFilters
 from tid_analyzer.api.state import ImportState
@@ -20,6 +27,15 @@ state = ImportState()
 
 class ImportRequest(BaseModel):
     folder_path: str
+
+
+class SpectralRequest(BaseModel):
+    station: str
+    prn: str
+    start_time_h: float | None = None
+    end_time_h: float | None = None
+    period_min_min: float = 2
+    period_min_max: float = 180
 
 
 def _require_source_folder() -> Path:
@@ -213,19 +229,17 @@ async def map_epoch(prn: str = Query(...), time_h: float = Query(...)) -> dict[s
     return {"prn": prn, "requested_time_h": time_h, "actual_time_h": actual_time_h, "epoch_index": epoch_index, "points": points, "count": len(points), "stations": sorted({str(p["station"]) for p in points})}
 
 
-@app.get("/api/stations/timeseries")
-async def station_timeseries(
-    station: list[str] = Query(...),
-    prn: str = Query(...),
-    start_time_h: float | None = None,
-    end_time_h: float | None = None,
-    max_points_per_series: int = Query(5000, ge=1, le=100000),
-) -> dict[str, object]:
-    requested = {part.strip().upper() for value in station for part in value.split(",") if part.strip()}
-    if not requested:
+def _station_query_values(station: list[str]) -> list[str]:
+    return sorted({part.strip().upper() for value in station for part in value.split(",") if part.strip()})
+
+
+def _rows_for_station_prn(stations: list[str], prn: str, start_time_h: float | None = None, end_time_h: float | None = None) -> dict[str, list[StationRow]]:
+    if not stations:
         raise HTTPException(status_code=400, detail="At least one station is required.")
-    clauses = ["UPPER(station) IN (" + ",".join("?" for _ in requested) + ")", "prn = ?"]
-    params: list[object] = [*sorted(requested), prn]
+    if start_time_h is not None and end_time_h is not None and start_time_h > end_time_h:
+        raise HTTPException(status_code=400, detail="start_time_h must be <= end_time_h.")
+    clauses = ["UPPER(station) IN (" + ",".join("?" for _ in stations) + ")", "prn = ?"]
+    params: list[object] = [*stations, prn]
     if start_time_h is not None:
         clauses.append("time_h >= ?")
         params.append(start_time_h)
@@ -233,17 +247,83 @@ async def station_timeseries(
         clauses.append("time_h <= ?")
         params.append(end_time_h)
     sql = "SELECT station, prn, time_h, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat FROM observations WHERE " + " AND ".join(clauses) + " ORDER BY station, time_h"
-    grouped: dict[str, list[StationRow]] = {name: [] for name in requested}
+    grouped: dict[str, list[StationRow]] = {name: [] for name in stations}
     with connect_cache(_require_cache_path()) as con:
         for tup in con.execute(sql, params).fetchall():
             row = _row_from_tuple(tup)
             grouped[row.station.upper()].append(row)
-    series = []
-    for name in sorted(grouped):
-        rows = grouped[name]
-        sampled, limit_reached = _deterministic_sample(rows, max_points_per_series)
-        series.append({"station": name, "prn": prn, "points": [{"time_h": r.time_h, "dtec": r.dtec, "elevation": r.elevation, "ipp_lon": r.ipp_lon, "ipp_lat": r.ipp_lat} for r in sampled], "total_matching_before_limit": len(rows), "limit_reached": limit_reached})
-    return {"series": series}
+    return grouped
+
+
+def _series_payload(name: str, prn: str, rows: list[StationRow], max_points: int) -> dict[str, Any]:
+    sampled, limit_reached = _deterministic_sample(rows, max_points)
+    return {"station": name, "prn": prn, "time_start_h": rows[0].time_h if rows else None, "time_end_h": rows[-1].time_h if rows else None, "points": [{"time_h": r.time_h, "dtec": r.dtec, "elevation": r.elevation, "ipp_lon": r.ipp_lon, "ipp_lat": r.ipp_lat} for r in sampled], "total_matching_before_limit": len(rows), "limit_reached": limit_reached}
+
+
+@app.get("/api/stations/timeseries")
+async def station_timeseries(
+    station: list[str] = Query(...),
+    prn: str = Query(...),
+    start_time_h: float | None = None,
+    end_time_h: float | None = None,
+    arc_mode: str = "continuous_arc",
+    max_points_per_series: int = Query(5000, ge=1, le=100000),
+) -> dict[str, object]:
+    if arc_mode != "continuous_arc":
+        raise HTTPException(status_code=400, detail="Only arc_mode=continuous_arc is currently supported.")
+    grouped = _rows_for_station_prn(_station_query_values(station), prn, start_time_h, end_time_h)
+    return {"series": [_series_payload(name, prn, grouped[name], max_points_per_series) for name in sorted(grouped)]}
+
+
+def _regularized_signal(request: SpectralRequest) -> tuple[np.ndarray, np.ndarray]:
+    grouped = _rows_for_station_prn([request.station.upper()], request.prn, request.start_time_h, request.end_time_h)
+    rows = grouped.get(request.station.upper(), [])
+    if len(rows) < 4:
+        raise HTTPException(status_code=400, detail="At least four observations are required for spectral analysis.")
+    t = np.array([r.time_h for r in rows], dtype=float)
+    y = np.array([r.dtec for r in rows], dtype=float)
+    order = np.argsort(t)
+    t, y = t[order], y[order]
+    uniq, idx = np.unique(t, return_index=True)
+    t, y = uniq, y[idx]
+    if len(t) < 4 or t[-1] <= t[0]:
+        raise HTTPException(status_code=400, detail="Time series is too short for spectral analysis.")
+    step_h = 30 / 3600
+    regular_t = np.arange(t[0], t[-1] + step_h / 2, step_h)
+    if len(regular_t) < 4:
+        raise HTTPException(status_code=400, detail="Time span is too short for spectral analysis.")
+    regular_y = np.interp(regular_t, t, y)
+    coeff = np.polyfit(regular_t - regular_t[0], regular_y, 1)
+    detrended = regular_y - np.polyval(coeff, regular_t - regular_t[0])
+    return regular_t, detrended
+
+
+@app.post("/api/spectral/fft")
+async def spectral_fft(request: SpectralRequest) -> dict[str, object]:
+    t, y = _regularized_signal(request)
+    dt_min = float(np.median(np.diff(t)) * 60)
+    freqs = np.fft.rfftfreq(len(y), d=dt_min)
+    amps = np.abs(np.fft.rfft(y)) * 2 / len(y)
+    mask = freqs > 0
+    periods = 1 / freqs[mask]
+    amps = amps[mask]
+    mask = (periods >= 2) & (periods <= 180)
+    return {"station": request.station.upper(), "prn": request.prn, "period_min": periods[mask].tolist(), "amplitude": amps[mask].tolist()}
+
+
+@app.post("/api/spectral/morlet")
+async def spectral_morlet(request: SpectralRequest) -> dict[str, object]:
+    if pywt is None:
+        raise HTTPException(status_code=500, detail="PyWavelets is required for Morlet analysis.")
+    if request.period_min_min <= 0 or request.period_min_max <= request.period_min_min:
+        raise HTTPException(status_code=400, detail="Invalid Morlet period range.")
+    t, y = _regularized_signal(request)
+    dt_min = float(np.median(np.diff(t)) * 60)
+    periods = np.linspace(request.period_min_min, request.period_min_max, 80)
+    wavelet = pywt.ContinuousWavelet("cmor1.5-1.0")
+    scales = pywt.frequency2scale(wavelet, 1 / (periods / dt_min))
+    coeffs, _ = pywt.cwt(y, scales, wavelet, sampling_period=dt_min)
+    return {"station": request.station.upper(), "prn": request.prn, "time_h": t.tolist(), "period_min": periods.tolist(), "power": (np.abs(coeffs) ** 2).tolist()}
 
 
 @app.post("/api/select-folder")
