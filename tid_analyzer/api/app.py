@@ -89,28 +89,35 @@ async def preview_points(
     tolerance_seconds: float = 15,
     max_points: int = Query(5000, ge=1, le=100000),
 ) -> dict[str, object]:
-    tolerance_h = tolerance_seconds / 3600.0
     if start_time_h is not None and end_time_h is not None and start_time_h > end_time_h:
         raise HTTPException(status_code=400, detail="start_time_h must be <= end_time_h.")
+    all_rows = _iter_import_rows()
     matching: list[StationRow] = []
+    actual_time_h: float | None = None
     mode = "whole_selected_satellite"
-    for row in _iter_import_rows():
-        if prn and row.prn != prn:
-            continue
-        if time_h is not None:
-            mode = "current_epoch"
-            if abs(row.time_h - time_h) > tolerance_h:
+    if time_h is not None:
+        mode = "current_epoch"
+        candidate_rows = [row for row in all_rows if not prn or row.prn == prn]
+        if candidate_rows:
+            actual_time_h = min({row.time_h for row in candidate_rows}, key=lambda value: (abs(value - time_h), value))
+        for row in candidate_rows:
+            if actual_time_h is not None and row.time_h == actual_time_h:
+                matching.append(row)
+    else:
+        for row in all_rows:
+            if prn and row.prn != prn:
                 continue
-        elif start_time_h is not None or end_time_h is not None:
-            mode = "selected_time_window"
-            if start_time_h is not None and row.time_h < start_time_h:
-                continue
-            if end_time_h is not None and row.time_h > end_time_h:
-                continue
-        matching.append(row)
+            if start_time_h is not None or end_time_h is not None:
+                mode = "selected_time_window"
+                if start_time_h is not None and row.time_h < start_time_h:
+                    continue
+                if end_time_h is not None and row.time_h > end_time_h:
+                    continue
+            matching.append(row)
     matching.sort(key=lambda r: (r.time_h, r.prn, r.station))
     sampled, limit_reached = _deterministic_sample(matching, max_points)
-    return {"points": [row.__dict__ for row in sampled], "count_returned": len(sampled), "total_matching_before_limit": len(matching), "limit_reached": limit_reached, "mode_used": mode}
+    station_markers = _station_markers(matching) if mode == "current_epoch" else []
+    return {"points": [row.__dict__ for row in sampled], "station_markers": station_markers, "interpolated_dtec": None, "raster_available": False, "requested_time_h": time_h, "actual_time_h": actual_time_h, "count_returned": len(sampled), "total_matching_before_limit": len(matching), "limit_reached": limit_reached, "mode_used": mode}
 
 
 @app.get("/api/satellites/visibility")
@@ -135,6 +142,23 @@ async def satellite_visibility(gap_minutes: float = Query(10, gt=0)) -> dict[str
         if current:
             arcs.append(_visibility_arc(prn, arc_index, current))
     return {"arcs": arcs}
+
+
+def _station_markers(rows: list[StationRow]) -> list[dict[str, object]]:
+    by_station: dict[str, list[StationRow]] = defaultdict(list)
+    for row in rows:
+        by_station[row.station].append(row)
+    markers: list[dict[str, object]] = []
+    for station in sorted(by_station):
+        station_rows = by_station[station]
+        markers.append({
+            "station": station,
+            "lon": sum(row.ipp_lon for row in station_rows) / len(station_rows),
+            "lat": sum(row.ipp_lat for row in station_rows) / len(station_rows),
+            "approximate": True,
+            "source": "mean_epoch_ipp",
+        })
+    return markers
 
 
 def _visibility_arc(prn: str, arc_index: int, rows: list[StationRow]) -> dict[str, object]:
