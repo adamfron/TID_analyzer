@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from tid_analyzer.config import ImportFilters
+from tid_analyzer.importer.cache import cache_path_for_day, create_daily_cache
 
 ProgressCallback = Callable[[str, int, int, str], None]
 
@@ -180,6 +181,25 @@ def build_manifest(folder: Path, cache_dir: Path, filters: ImportFilters | None 
         parse_station_file(path, builder)
 
     manifest = builder.to_manifest()
+    cache_path = cache_path_for_day(cache_dir, manifest["year"], manifest["doy"])
+
+    def valid_rows() -> Iterator[StationRow]:
+        for station_file in files:
+            yield from iter_valid_rows(station_file, filters)
+
+    metadata = {
+        "source_folder": str(folder),
+        "year": manifest["year"],
+        "doy": manifest["doy"],
+        "min_time_h": manifest["time_range_hours"]["min"],
+        "max_time_h": manifest["time_range_hours"]["max"],
+        "station_count": manifest["station_count"],
+        "prn_count": len(manifest["gps_prns"]),
+        "valid_rows": manifest["valid_rows_after_filters"],
+    }
+    progress and progress("writing_cache", 0, manifest["valid_rows_after_filters"], "Writing DuckDB daily cache")
+    create_daily_cache(cache_path, valid_rows(), metadata, filters)
+    manifest["cache_path"] = str(cache_path)
     cache_dir.mkdir(parents=True, exist_ok=True)
     (cache_dir / "day_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     message = "Done" if builder.valid_rows_after_filters else "Import completed, but no valid rows passed filters. Check parser format, constellation, elevation, and map bounds."
