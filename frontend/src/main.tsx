@@ -88,6 +88,31 @@ function Explorer(p:any) {
 function TimeSeries({selected,setSelected,load,loading,series,selectedLine,setSelectedLine}:any) { return <div><p>{selected.length ? selected.map((s:string)=><button key={s} onClick={()=>setSelected((x:string[])=>x.filter(y=>y!==s))}>{s} ×</button>) : <span className="placeholder">Click map points to select station/PRN.</span>}</p><button onClick={load} disabled={!selected.length || loading} title="Load dTEC time series for selected stations.">{loading ? 'Loading time series…' : 'Load time series'}</button><button onClick={()=>setSelected([])}>Clear</button><SeriesPlot series={series} selectedLine={selectedLine} setSelectedLine={setSelectedLine}/></div>; }
 function Placeholder({text}:{text:string}) { return <p className="placeholder">{text}<br/><button disabled>Compute FFT</button> <button disabled>Compute Morlet</button></p>; }
 function PreviewPlot({points,world,selected,onPointClick}:any) { const [tip,setTip]=useState(''); const visiblePoints = points.filter((p:Point)=>p.ipp_lon >= bounds.lonMin && p.ipp_lon <= bounds.lonMax && p.ipp_lat >= bounds.latMin && p.ipp_lat <= bounds.latMax); const w=820,h=560,pad=55; const x=(lon:number)=>pad+(lon-bounds.lonMin)/(bounds.lonMax-bounds.lonMin)*(w-2*pad); const y=(lat:number)=>h-pad-(lat-bounds.latMin)/(bounds.latMax-bounds.latMin)*(h-2*pad); const max=Math.max(1,...visiblePoints.map((p:Point)=>Math.abs(p.dtec))); const color=(v:number)=>v<0?`rgb(${255+v/max*155},${255+v/max*155},255)`: `rgb(255,${255-v/max*155},${255-v/max*155})`; return <><svg viewBox={`0 0 ${w} ${h}`} className="plot">{[-20,0,20,40,50].map(l=><g key={'x'+l}><line x1={x(l)} x2={x(l)} y1={pad} y2={h-pad}/><text x={x(l)} y={h-18}>{l}°</text></g>)}{[20,40,60,80].map(l=><g key={'y'+l}><line x1={pad} x2={w-pad} y1={y(l)} y2={y(l)}/><text x={12} y={y(l)}>{l}°</text></g>)}<Borders world={world} x={x} y={y}/>{visiblePoints.map((p:Point,i:number)=>{const id=`${p.station}|${p.prn}`; const sel=selected.includes(id); return <circle key={i} cx={x(p.ipp_lon)} cy={y(p.ipp_lat)} r={sel?7:4} fill={color(p.dtec)} stroke={sel?'#ffe66d':'#06101d'} onClick={()=>onPointClick(p)} onMouseEnter={()=>setTip(`${p.station} ${p.prn} dTEC=${p.dtec} time=${p.time_h}h elev=${p.elevation} lon=${p.ipp_lon} lat=${p.ipp_lat}`)} />})}</svg><p className="tooltip">{tip || 'Click IPP points to toggle station selection.'}</p></>; }
-function Borders({world,x,y}:any){ if(!world?.features) return null; const paths:string[]=[]; const add=(coords:any[])=>{let d=''; coords.forEach((c:any,i:number)=>{ if(c[0]<bounds.lonMin||c[0]>bounds.lonMax||c[1]<bounds.latMin||c[1]>bounds.latMax) return; d += `${d?'L':'M'}${x(c[0])},${y(c[1])}`; }); if(d) paths.push(d); }; world.features.forEach((f:any)=>{const g=f.geometry; if(!g) return; if(g.type==='LineString') add(g.coordinates); if(g.type==='Polygon') g.coordinates.forEach(add); if(g.type==='MultiPolygon') g.coordinates.flat().forEach(add);}); return <g className="borders">{paths.map((d,i)=><path key={i} d={d}/>)}</g>; }
+function Borders({world,x,y}:any){
+  const paths:string[]=[];
+  const inMapBounds=(c:any)=>Array.isArray(c) && c.length >= 2 && c[0] >= bounds.lonMin && c[0] <= bounds.lonMax && c[1] >= bounds.latMin && c[1] <= bounds.latMax;
+  const addRing=(coords:any[])=>{
+    let d='';
+    coords.forEach((c:any)=>{
+      if(!inMapBounds(c)){ if(d){ paths.push(d); d=''; } return; }
+      d += `${d?'L':'M'}${x(c[0])},${y(c[1])}`;
+    });
+    if(d) paths.push(d);
+  };
+  const addGeometry=(g:any)=>{
+    if(!g) return;
+    if(g.type==='LineString') addRing(g.coordinates);
+    if(g.type==='Polygon') g.coordinates.forEach(addRing);
+    if(g.type==='MultiPolygon') g.coordinates.forEach((polygon:any[])=>polygon.forEach(addRing));
+  };
+  const addGeoJson=(item:any)=>{
+    if(!item) return;
+    if(item.type==='FeatureCollection') item.features?.forEach(addGeoJson);
+    else if(item.type==='Feature') addGeometry(item.geometry);
+    else addGeometry(item);
+  };
+  addGeoJson(world);
+  return paths.length ? <g className="borders">{paths.map((d,i)=><path key={i} d={d}/>)}</g> : null;
+}
 function SeriesPlot({series,selectedLine,setSelectedLine}:any){ if(!series?.length) return null; const pts=series.flatMap((s:Series)=>s.points); if(!pts.length) return <p className="placeholder">No time-series points.</p>; const w=330,h=190,pad=28; const minT=Math.min(...pts.map((p:any)=>p.time_h)), maxT=Math.max(...pts.map((p:any)=>p.time_h)); const minD=Math.min(...pts.map((p:any)=>p.dtec)), maxD=Math.max(...pts.map((p:any)=>p.dtec)); const x=(t:number)=>pad+(t-minT)/Math.max(1e-9,maxT-minT)*(w-2*pad); const y=(d:number)=>h-pad-(d-minD)/Math.max(1e-9,maxD-minD)*(h-2*pad); return <svg viewBox={`0 0 ${w} ${h}`} className="series">{series.map((s:Series,i:number)=>{const key=`${s.station}|${s.prn}`; const d=s.points.map((p,j)=>`${j?'L':'M'}${x(p.time_h)},${y(p.dtec)}`).join(''); return <path key={key} d={d} className={selectedLine===key?'line selectedLine':'line'} style={{stroke:['#66d9ff','#ffc857','#7ee081','#ff6b9a'][i%4]}} onClick={()=>setSelectedLine(key)}/>})}</svg>; }
 createRoot(document.getElementById('root')!).render(<App />);
