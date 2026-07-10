@@ -13,3 +13,7 @@ table { width:100%; border-collapse: collapse; font-size: 12px; margin-top: 8px;
 .plot { flex: 1; min-height: 0; width: 100%; background: #0d1829; border: 1px solid #29405f; border-radius: 10px; } .plot line { stroke: #29405f; stroke-width: 1; } .plot text { fill: #9fb4d3; font-size: 13px; } .plot circle { stroke-width: 1.5; cursor:pointer; } .borders path { fill:none; stroke:#7187a8; stroke-width:1.1; opacity:.72; pointer-events:none; }
 .tooltip { color: #c6d8f6; min-height: 22px; margin: 8px 0 0; } .series { width:100%; margin-top:10px; background:#091524; border:1px solid #274160; border-radius:8px; } .line { fill:none; stroke-width:2; cursor:pointer; } .selectedLine { stroke-width:4; filter: drop-shadow(0 0 4px #fff); }
 footer { display: flex; align-items: center; padding: 0 14px; border-top: 1px solid #223656; color: #9fb4d3; background: #0e1b2e; font-size: 12px; }
+.spinner { width: 14px; height: 14px; border: 2px solid #3c5e8f; border-top-color: #dbe7ff; border-radius: 50%; animation: spin .8s linear infinite; }
+details { border: 1px solid #253a5c; border-radius: 8px; padding: 7px 9px; margin: 8px 0; background: #0d1c31; }
+summary { cursor: pointer; color: #c6d8f6; font-weight: 700; }
+@keyframes spin { to { transform: rotate(360deg); } }
