@@ -10,7 +10,8 @@ from pydantic import BaseModel
 
 from tid_analyzer.config import ImportFilters
 from tid_analyzer.api.state import ImportState
-from tid_analyzer.importer.parser import StationRow, iter_station_files, iter_valid_rows
+from tid_analyzer.importer.cache import connect_cache
+from tid_analyzer.importer.parser import StationRow, build_manifest, iter_station_files, iter_valid_rows
 
 app = FastAPI(title="TID Analyzer API")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -25,6 +26,27 @@ def _require_source_folder() -> Path:
     if state.source_folder is None:
         raise HTTPException(status_code=404, detail="No folder has been imported yet.")
     return state.source_folder
+
+
+def _require_cache_path() -> Path:
+    if state.cache_path is not None and state.cache_path.exists():
+        return state.cache_path
+    if state.manifest and state.manifest.get("cache_path"):
+        path = Path(str(state.manifest["cache_path"]))
+        if path.exists():
+            state.cache_path = path
+            return path
+    if state.source_folder is not None:
+        manifest = build_manifest(state.source_folder, state.cache_dir, ImportFilters())
+        state.manifest = manifest
+        path = Path(str(manifest["cache_path"]))
+        state.cache_path = path
+        return path
+    raise HTTPException(status_code=404, detail="No DuckDB cache is available yet. Start an import first.")
+
+
+def _row_from_tuple(values: tuple[object, ...]) -> StationRow:
+    return StationRow(station=str(values[0]), prn=str(values[1]), time_h=float(values[2]), dtec=float(values[4]), azimuth=float(values[5]), elevation=float(values[6]), ipp_lon=float(values[7]), ipp_lat=float(values[8]))
 
 
 def _iter_import_rows() -> list[StationRow]:
@@ -91,30 +113,38 @@ async def preview_points(
 ) -> dict[str, object]:
     if start_time_h is not None and end_time_h is not None and start_time_h > end_time_h:
         raise HTTPException(status_code=400, detail="start_time_h must be <= end_time_h.")
-    all_rows = _iter_import_rows()
-    matching: list[StationRow] = []
-    actual_time_h: float | None = None
+    cache_path = _require_cache_path()
+    params: list[object] = []
     mode = "whole_selected_satellite"
+    actual_time_h: float | None = None
+    where: list[str] = []
+    if prn:
+        where.append("prn = ?")
+        params.append(prn)
     if time_h is not None:
         mode = "current_epoch"
-        candidate_rows = [row for row in all_rows if not prn or row.prn == prn]
-        if candidate_rows:
-            actual_time_h = min({row.time_h for row in candidate_rows}, key=lambda value: (abs(value - time_h), value))
-        for row in candidate_rows:
-            if actual_time_h is not None and row.time_h == actual_time_h:
-                matching.append(row)
-    else:
-        for row in all_rows:
-            if prn and row.prn != prn:
-                continue
-            if start_time_h is not None or end_time_h is not None:
-                mode = "selected_time_window"
-                if start_time_h is not None and row.time_h < start_time_h:
-                    continue
-                if end_time_h is not None and row.time_h > end_time_h:
-                    continue
-            matching.append(row)
-    matching.sort(key=lambda r: (r.time_h, r.prn, r.station))
+        with connect_cache(cache_path) as con:
+            row = con.execute("SELECT epoch_index, time_h FROM prn_epochs WHERE (? IS NULL OR prn = ?) ORDER BY ABS(time_h - ?), time_h LIMIT 1", [prn, prn, time_h]).fetchone()
+        if row is not None:
+            epoch_index = int(row[0])
+            actual_time_h = float(row[1])
+            where.append("epoch_index = ?")
+            params.append(epoch_index)
+    elif start_time_h is not None or end_time_h is not None:
+        mode = "selected_time_window"
+        if start_time_h is not None:
+            where.append("time_h >= ?")
+            params.append(start_time_h)
+        if end_time_h is not None:
+            where.append("time_h <= ?")
+            params.append(end_time_h)
+    sql = "SELECT station, prn, time_h, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat FROM observations"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY time_h, prn, station"
+    with connect_cache(cache_path) as con:
+        tuples = con.execute(sql, params).fetchall()
+    matching = [_row_from_tuple(t) for t in tuples]
     sampled, limit_reached = _deterministic_sample(matching, max_points)
     station_markers = _station_markers(matching) if mode == "current_epoch" else []
     return {"points": [row.__dict__ for row in sampled], "station_markers": station_markers, "interpolated_dtec": None, "raster_available": False, "requested_time_h": time_h, "actual_time_h": actual_time_h, "count_returned": len(sampled), "total_matching_before_limit": len(matching), "limit_reached": limit_reached, "mode_used": mode}
@@ -122,25 +152,28 @@ async def preview_points(
 
 @app.get("/api/satellites/visibility")
 async def satellite_visibility(gap_minutes: float = Query(10, gt=0)) -> dict[str, object]:
-    by_prn: dict[str, list[StationRow]] = defaultdict(list)
-    for row in _iter_import_rows():
-        by_prn[row.prn].append(row)
-    gap_h = gap_minutes / 60.0
+    cache_path = _require_cache_path()
+    gap_epochs = gap_minutes * 60 / 30
     arcs: list[dict[str, object]] = []
-    for prn in sorted(by_prn):
-        rows = sorted(by_prn[prn], key=lambda r: r.time_h)
-        current: list[StationRow] = []
-        arc_index = 1
-        previous_time: float | None = None
-        for row in rows:
-            if current and previous_time is not None and row.time_h - previous_time > gap_h:
-                arcs.append(_visibility_arc(prn, arc_index, current))
-                arc_index += 1
-                current = []
-            current.append(row)
-            previous_time = row.time_h
-        if current:
-            arcs.append(_visibility_arc(prn, arc_index, current))
+    with connect_cache(cache_path) as con:
+        rows = con.execute("SELECT prn, epoch_index, time_h, row_count, station_count FROM prn_epochs ORDER BY prn, epoch_index").fetchall()
+    current: list[tuple[str, int, float, int, int]] = []
+    arc_index = 1
+    previous_prn: str | None = None
+    previous_epoch: int | None = None
+    for prn, epoch_index, time_h, row_count, station_count in rows:
+        prn = str(prn); epoch_index = int(epoch_index)
+        starts_new_prn = previous_prn is not None and prn != previous_prn
+        gap_split = previous_epoch is not None and epoch_index - previous_epoch > gap_epochs
+        if current and (starts_new_prn or gap_split):
+            arcs.append(_visibility_arc_from_epochs(current[0][0], arc_index, current))
+            arc_index = 1 if starts_new_prn else arc_index + 1
+            current = []
+        current.append((prn, epoch_index, float(time_h), int(row_count), int(station_count)))
+        previous_prn = prn
+        previous_epoch = epoch_index
+    if current:
+        arcs.append(_visibility_arc_from_epochs(current[0][0], arc_index, current))
     return {"arcs": arcs}
 
 
@@ -161,10 +194,23 @@ def _station_markers(rows: list[StationRow]) -> list[dict[str, object]]:
     return markers
 
 
-def _visibility_arc(prn: str, arc_index: int, rows: list[StationRow]) -> dict[str, object]:
-    start = rows[0].time_h
-    end = rows[-1].time_h
-    return {"prn": prn, "arc_index": arc_index, "start_time_h": start, "end_time_h": end, "duration_min": (end - start) * 60, "row_count": len(rows), "station_count": len({r.station for r in rows})}
+def _visibility_arc_from_epochs(prn: str, arc_index: int, rows: list[tuple[str, int, float, int, int]]) -> dict[str, object]:
+    start = rows[0][2]
+    end = rows[-1][2]
+    return {"prn": prn, "arc_index": arc_index, "start_time_h": start, "end_time_h": end, "duration_min": (end - start) * 60, "row_count": sum(r[3] for r in rows), "station_count": max(r[4] for r in rows), "epoch_count": len(rows)}
+
+
+@app.get("/api/map/epoch")
+async def map_epoch(prn: str = Query(...), time_h: float = Query(...)) -> dict[str, object]:
+    cache_path = _require_cache_path()
+    with connect_cache(cache_path) as con:
+        epoch = con.execute("SELECT epoch_index, time_h FROM prn_epochs WHERE prn = ? ORDER BY ABS(time_h - ?), time_h LIMIT 1", [prn, time_h]).fetchone()
+        if epoch is None:
+            raise HTTPException(status_code=404, detail=f"No epochs are available for PRN {prn}.")
+        epoch_index, actual_time_h = int(epoch[0]), float(epoch[1])
+        rows = con.execute("SELECT station, prn, time_h, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat FROM observations WHERE prn = ? AND epoch_index = ? ORDER BY station", [prn, epoch_index]).fetchall()
+    points = [_row_from_tuple(t).__dict__ for t in rows]
+    return {"prn": prn, "requested_time_h": time_h, "actual_time_h": actual_time_h, "epoch_index": epoch_index, "points": points, "count": len(points), "stations": sorted({str(p["station"]) for p in points})}
 
 
 @app.get("/api/stations/timeseries")
@@ -178,18 +224,23 @@ async def station_timeseries(
     requested = {part.strip().upper() for value in station for part in value.split(",") if part.strip()}
     if not requested:
         raise HTTPException(status_code=400, detail="At least one station is required.")
+    clauses = ["UPPER(station) IN (" + ",".join("?" for _ in requested) + ")", "prn = ?"]
+    params: list[object] = [*sorted(requested), prn]
+    if start_time_h is not None:
+        clauses.append("time_h >= ?")
+        params.append(start_time_h)
+    if end_time_h is not None:
+        clauses.append("time_h <= ?")
+        params.append(end_time_h)
+    sql = "SELECT station, prn, time_h, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat FROM observations WHERE " + " AND ".join(clauses) + " ORDER BY station, time_h"
     grouped: dict[str, list[StationRow]] = {name: [] for name in requested}
-    for row in _iter_import_rows():
-        if row.station.upper() not in requested or row.prn != prn:
-            continue
-        if start_time_h is not None and row.time_h < start_time_h:
-            continue
-        if end_time_h is not None and row.time_h > end_time_h:
-            continue
-        grouped[row.station.upper()].append(row)
+    with connect_cache(_require_cache_path()) as con:
+        for tup in con.execute(sql, params).fetchall():
+            row = _row_from_tuple(tup)
+            grouped[row.station.upper()].append(row)
     series = []
     for name in sorted(grouped):
-        rows = sorted(grouped[name], key=lambda r: r.time_h)
+        rows = grouped[name]
         sampled, limit_reached = _deterministic_sample(rows, max_points_per_series)
         series.append({"station": name, "prn": prn, "points": [{"time_h": r.time_h, "dtec": r.dtec, "elevation": r.elevation, "ipp_lon": r.ipp_lon, "ipp_lat": r.ipp_lat} for r in sampled], "total_matching_before_limit": len(rows), "limit_reached": limit_reached})
     return {"series": series}

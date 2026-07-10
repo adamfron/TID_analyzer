@@ -159,3 +159,40 @@ def test_station_timeseries_endpoint_returns_selected_station_series() -> None:
     assert data["series"][0]["station"] == "LAMA"
     assert data["series"][0]["prn"] == "G24"
     assert [p["time_h"] for p in data["series"][0]["points"]] == [0.0]
+
+
+def test_import_creates_duckdb_cache(tmp_path: Path) -> None:
+    manifest = build_manifest(FIXTURES, tmp_path / "cache")
+    cache_path = Path(str(manifest["cache_path"]))
+    assert cache_path.exists()
+
+
+def test_observations_table_has_expected_filtered_rows(tmp_path: Path) -> None:
+    import duckdb
+    manifest = build_manifest(FIXTURES, tmp_path / "cache")
+    with duckdb.connect(str(manifest["cache_path"]), read_only=True) as con:
+        assert con.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 4
+        assert con.execute("SELECT COUNT(*) FROM observations WHERE prn NOT LIKE 'G%' OR elevation < 50").fetchone()[0] == 0
+
+
+def test_epoch_index_is_30_second_rounding(tmp_path: Path) -> None:
+    import duckdb
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "TEST_2024_246.txt").write_text("0.0083333333;G24;1;1;80;10;50\n", encoding="utf-8")
+    manifest = build_manifest(folder, tmp_path / "cache")
+    with duckdb.connect(str(manifest["cache_path"]), read_only=True) as con:
+        assert con.execute("SELECT epoch_index FROM observations").fetchone()[0] == 1
+
+
+def test_map_epoch_endpoint_snaps_and_returns_points(tmp_path: Path) -> None:
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "TEST_2024_246.txt").write_text("0.0;G24;1;1;80;10;50\n0.5;G24;2;1;80;11;51\n", encoding="utf-8")
+    manifest = build_manifest(folder, tmp_path / "cache")
+    state.source_folder = folder
+    state.manifest = manifest
+    state.cache_path = Path(str(manifest["cache_path"]))
+    data = TestClient(app).get("/api/map/epoch?prn=G24&time_h=0.49").json()
+    assert data["actual_time_h"] == 0.5
+    assert data["count"] == 1
+    assert data["stations"] == ["TEST"]
+    assert data["points"][0]["dtec"] == 2.0

@@ -15,6 +15,7 @@ class ImportState:
     status: dict[str, Any] = field(default_factory=lambda: {"stage": "idle", "current": 0, "total": 0, "message": "Idle"})
     manifest: dict[str, Any] | None = None
     source_folder: Path | None = None
+    cache_path: Path | None = None
     queue: asyncio.Queue[dict[str, Any]] = field(default_factory=asyncio.Queue)
     task: asyncio.Task[None] | None = None
 
@@ -37,5 +38,7 @@ class ImportState:
             manifest = await asyncio.to_thread(build_manifest, folder, self.cache_dir, ImportFilters(), progress)
             self.manifest = manifest
             self.source_folder = folder
+            cache_path = manifest.get("cache_path")
+            self.cache_path = Path(str(cache_path)) if cache_path else None
         except Exception as exc:  # noqa: BLE001 - message is surfaced to local UI
             await self.publish({"stage": "error", "current": 0, "total": 0, "message": str(exc)})
