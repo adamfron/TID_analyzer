@@ -20,6 +20,18 @@ if (-not (Test-Path ".venv")) {
 . .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -e ".[dev]"
+
+$requiredAssets = @(
+  "assets/world/TM_WORLD_BORDERS-0.3.geojson",
+  "assets/world/EUREF Permanent GNSS Network.csv"
+)
+foreach ($asset in $requiredAssets) {
+  if (-not (Test-Path -LiteralPath $asset)) {
+    Write-Host "Required bundled asset is missing. Pull the complete repository before running setup."
+    Write-Host "Missing: $asset"
+    exit 1
+  }
+}
 Push-Location frontend
 npm install
 Pop-Location

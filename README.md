@@ -30,6 +30,18 @@ Later runs:
 .\run_windows.ps1
 ```
 
+Developer-phase database reset:
+
+```powershell
+.\developer_reset_cache_windows.ps1
+```
+
+Reset and start:
+
+```powershell
+.\developer_reset_cache_windows.ps1 -Run
+```
+
 If the repo is updated, run `setup_windows.ps1` again when dependencies change. Otherwise, `run_windows.ps1` is enough.
 
 Do not open `frontend/index.html` directly. The backend runs on `127.0.0.1:8000`, and the frontend runs on `127.0.0.1:5173`.

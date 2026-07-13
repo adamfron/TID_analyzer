@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from tid_analyzer.importer.parser import StationRow
 
 OBS_COLUMNS = "station, prn, time_h, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat"
-CACHE_VERSION = "duckdb_daily_v4"
+CACHE_VERSION = "duckdb_daily_v5"
 
 
 def epoch_index_for_time(time_h: float, step_seconds: int = 30) -> int:
@@ -62,8 +62,8 @@ def create_schema(con: duckdb.DuckDBPyConnection) -> None:
     """)
     con.execute("""
         CREATE TABLE IF NOT EXISTS stations (
-            station VARCHAR PRIMARY KEY, full_site_id VARCHAR, longitude DOUBLE, latitude DOUBLE,
-            height DOUBLE, x DOUBLE, y DOUBLE, z DOUBLE, coordinate_source VARCHAR,
+            station VARCHAR PRIMARY KEY, full_site_id VARCHAR, city VARCHAR, country VARCHAR, domes VARCHAR,
+            longitude DOUBLE, latitude DOUBLE, height DOUBLE, x DOUBLE, y DOUBLE, z DOUBLE, coordinate_source VARCHAR,
             reference_frame VARCHAR, coordinate_epoch VARCHAR, resolved BOOLEAN, resolution_note VARCHAR
         )
     """)

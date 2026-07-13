@@ -193,8 +193,8 @@ def extract_station_codes(files: list[Path]) -> list[str]:
 def populate_stations_table(con, station_codes: list[str], cache_dir: Path) -> tuple[int, int]:
     rows = resolve_stations(station_codes, cache_dir)
     con.executemany(
-        "INSERT OR REPLACE INTO stations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [(r.station, r.full_site_id, r.longitude, r.latitude, r.height, r.x, r.y, r.z, r.coordinate_source, r.reference_frame, r.coordinate_epoch, r.resolved, r.resolution_note) for r in rows],
+        "INSERT OR REPLACE INTO stations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [(r.station, r.full_site_id, r.city, r.country, r.domes, r.longitude, r.latitude, r.height, r.x, r.y, r.z, r.coordinate_source, r.reference_frame, r.coordinate_epoch, r.resolved, r.resolution_note) for r in rows],
     )
     return sum(1 for r in rows if r.resolved), len(rows)
 
@@ -350,7 +350,7 @@ def build_manifest(folder: Path, cache_dir: Path, filters: ImportFilters | None 
         _progress(progress, "resolving_stations", 0, max(len(station_codes), 1), "[2/7] Resolving station coordinates")
         create_schema(con); create_metadata_table(con)
         resolved_count, station_total = populate_stations_table(con, station_codes, cache_dir)
-        _progress(progress, "resolving_stations", resolved_count, max(station_total, 1), f"[2/7] Resolved {resolved_count} of {station_total} station coordinates")
+        _progress(progress, "stations_resolved", resolved_count, max(station_total, 1), f"[2/7] Station catalogue ready: resolved {resolved_count} of {station_total} station coordinates")
         _progress(progress, "preparing_database", 0, 1, "[3/7] Preparing daily database")
         if not files:
             raise ValueError("No .txt source files found in input folder")
