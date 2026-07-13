@@ -115,6 +115,18 @@ async def get_manifest() -> dict[str, object]:
     return state.manifest
 
 
+@app.get("/api/stations/catalog")
+async def station_catalog() -> dict[str, object]:
+    cache_path = _require_cache_path()
+    with connect_cache(cache_path) as con:
+        try:
+            rows = con.execute("SELECT station, full_site_id, longitude, latitude, height, resolved, coordinate_source, resolution_note FROM stations ORDER BY station").fetchall()
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail="Station catalogue is not available yet.") from exc
+    stations = [{"station": r[0], "full_site_id": r[1], "lon": r[2], "lat": r[3], "height": r[4], "resolved": bool(r[5]), "source": r[6], "resolution_note": r[7]} for r in rows]
+    resolved = sum(1 for s in stations if s["resolved"])
+    return {"total": len(stations), "resolved": resolved, "unresolved": len(stations) - resolved, "stations": stations}
+
 @app.get("/api/assets/world-borders")
 async def world_borders() -> Response:
     try:

@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from tid_analyzer.config import ImportFilters
-from tid_analyzer.importer.cache import CACHE_VERSION, cache_is_valid, cache_path_for_day, configure_connection, create_metadata_table, create_schema, finalize_cache, source_file_sql, row_to_record
+from tid_analyzer.stations.catalog import resolve_stations, station_code_from_filename
+from tid_analyzer.importer.cache import CACHE_VERSION, cache_is_valid, cache_path_for_day, configure_connection, create_metadata_table, create_schema, finalize_cache, source_file_sql, row_to_record, csv_relation_sql, parsed_valid_expr, normalized_prn_expr
 
 ProgressCallback = Callable[[str, int, int, str], None]
 CancelCallback = Callable[[], bool]
@@ -101,7 +102,7 @@ class ManifestBuilder:
 
 
 def station_from_filename(path: Path) -> str:
-    return path.name.split("_", 1)[0]
+    return station_code_from_filename(path)
 
 
 def iter_station_files(folder: Path) -> list[Path]:
@@ -120,7 +121,7 @@ def parse_row(line: str, station: str) -> StationRow | None:
     return StationRow(
         station=station,
         time_h=float(parts[0]),
-        prn=parts[1],
+        prn=parts[1].upper(),
         dtec=float(parts[2]),
         azimuth=float(parts[3]),
         elevation=float(parts[4]),
@@ -184,6 +185,56 @@ def _detect_day(files: list[Path]) -> tuple[set[int], set[int]]:
     return years, doys
 
 
+
+def extract_station_codes(files: list[Path]) -> list[str]:
+    return sorted({station_from_filename(path) for path in files})
+
+
+def populate_stations_table(con, station_codes: list[str], cache_dir: Path) -> tuple[int, int]:
+    rows = resolve_stations(station_codes, cache_dir)
+    con.executemany(
+        "INSERT OR REPLACE INTO stations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [(r.station, r.full_site_id, r.longitude, r.latitude, r.height, r.x, r.y, r.z, r.coordinate_source, r.reference_frame, r.coordinate_epoch, r.resolved, r.resolution_note) for r in rows],
+    )
+    return sum(1 for r in rows if r.resolved), len(rows)
+
+
+def preflight_validate(files: list[Path], filters: ImportFilters) -> dict[str, object]:
+    raw_prns: list[str] = []; norm_prns: list[str] = []; elevs: list[float] = []; lons: list[float] = []; lats: list[float] = []
+    rows_sampled = parsed = gps = pass_elev = pass_bounds = pass_all = 0
+    for path in files[:3]:
+        taken = 0
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                rows_sampled += 1; taken += 1
+                try:
+                    row = parse_row(line, station_from_filename(path))
+                except ValueError:
+                    row = None
+                if row is not None:
+                    parsed += 1
+                    raw = line.strip().split(";")[1] if ";" in line else ""
+                    raw_prns.append(raw); norm_prns.append(row.prn)
+                    elevs.append(row.elevation); lons.append(row.ipp_lon); lats.append(row.ipp_lat)
+                    is_gps = row.prn.startswith(filters.constellation_prefix.upper())
+                    if is_gps: gps += 1
+                    if is_gps and row.elevation >= filters.min_elevation_deg: pass_elev += 1
+                    in_bounds = filters.lon_min <= row.ipp_lon <= filters.lon_max and filters.lat_min <= row.ipp_lat <= filters.lat_max
+                    if is_gps and row.elevation >= filters.min_elevation_deg and in_bounds: pass_all += 1
+                    if in_bounds: pass_bounds += 1
+                if taken >= 100:
+                    break
+    diag = {"rows_sampled": rows_sampled, "rows_parsed": parsed, "raw_sample_prns": raw_prns[:10], "normalized_sample_prns": norm_prns[:10], "gps_rows": gps, "rows_passing_elevation": pass_elev, "rows_passing_bounds": pass_bounds, "rows_passing_all_filters": pass_all, "elevation_range": [min(elevs), max(elevs)] if elevs else None, "lon_range": [min(lons), max(lons)] if lons else None, "lat_range": [min(lats), max(lats)] if lats else None}
+    if parsed > 0 and gps == 0:
+        raise ValueError(f"No sampled rows passed the GPS filter. Example raw PRNs: {raw_prns[:5]}. Check whitespace normalization and constellation settings.")
+    if gps and pass_elev == 0:
+        raise ValueError(f"No sampled GPS rows passed the elevation filter. Sampled elevation range: {diag['elevation_range']}.")
+    if pass_elev and pass_all == 0:
+        raise ValueError(f"No sampled GPS/elevation rows passed geographic bounds. Sampled lon range: {diag['lon_range']}; lat range: {diag['lat_range']}.")
+    return diag
+
 def _fallback_import_file(con, path: Path, filters: ImportFilters) -> tuple[int, int, int, int, int, int]:
     builder = ManifestBuilder(path.parent, filters)
     parse_station_file(path, builder)
@@ -222,16 +273,17 @@ def build_manifest(folder: Path, cache_dir: Path, filters: ImportFilters | None 
     if not folder.exists() or not folder.is_dir():
         raise ValueError(f"Input folder does not exist or is not a directory: {folder}")
 
-    _progress(progress, "scanning_files", 0, 1, "[1/6] Scanning files")
+    _progress(progress, "scanning_files", 0, 1, "[1/7] Scanning files")
     files = iter_station_files(folder)
     years, doys = _detect_day(files)
     year = next(iter(years)) if len(years) == 1 else None
     doy = next(iter(doys)) if len(doys) == 1 else None
     cache_path = cache_path_for_day(cache_dir, year, doy, filters)
-    _progress(progress, "scanning_files", 1, 1, f"[1/6] Found {len(files)} source files")
+    _progress(progress, "scanning_files", 1, 1, f"[1/7] Found {len(files)} source files")
+    station_codes = extract_station_codes(files)
 
     if not force_rebuild and cache_is_valid(cache_path, folder, files, year, doy, filters):
-        _progress(progress, "finalizing_cache", 1, 1, "[6/6] Existing daily cache loaded")
+        _progress(progress, "finalizing_cache", 1, 1, "[7/7] Existing daily cache loaded")
         return _manifest_from_cache(folder, cache_path, filters)
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -240,24 +292,29 @@ def build_manifest(folder: Path, cache_dir: Path, filters: ImportFilters | None 
     total_seen = 0; valid_stored = 0; malformed = 0; non_gps = 0; low_elev = 0; out_bounds = 0
     with duckdb.connect(str(cache_path)) as con:
         configure_connection(con); create_schema(con); create_metadata_table(con)
+        _progress(progress, "resolving_stations", 0, max(len(station_codes), 1), "[2/7] Resolving station coordinates")
+        resolved_count, station_total = populate_stations_table(con, station_codes, cache_dir)
+        _progress(progress, "stations_resolved", resolved_count, max(station_total, 1), f"[2/7] Resolved {resolved_count} of {station_total} station coordinates")
+        _progress(progress, "validating_input", 0, 1, "[3/7] Validating input format and filters")
+        preflight = preflight_validate(files, filters)
+        _progress(progress, "validating_input", 1, 1, f"[3/7] Input preflight passed: {preflight['rows_passing_all_filters']} of {preflight['rows_sampled']} sampled rows pass filters")
         con.execute("DELETE FROM metadata")
         con.execute("INSERT INTO metadata VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [str(folder), year, doy, filters.min_elevation_deg, filters.lon_min, filters.lon_max, filters.lat_min, filters.lat_max, len(files), 0, 0, datetime.now(timezone.utc).isoformat(), False, CACHE_VERSION])
         for index, path in enumerate(files, start=1):
             if cancel and cancel():
                 con.execute("UPDATE metadata SET completed=false, total_rows_seen=?, valid_rows_stored=?", [total_seen, valid_stored])
                 raise RuntimeError("Import cancelled")
-            _progress(progress, "reading_filtering", index, len(files), f"[2/6] Reading file {index} of {len(files)}: {path.name}")
+            _progress(progress, "reading_filtering", index, len(files), f"[4/7] Reading file {index} of {len(files)}: {path.name}")
             before = con.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
             try:
-                safe_count_path = str(path).replace("'", "''")
-                parsed_sql = f"read_csv('{safe_count_path}', delim=';', header=false, columns={{'time_h':'DOUBLE','prn':'VARCHAR','dtec':'DOUBLE','azimuth':'DOUBLE','elevation':'DOUBLE','ipp_lon':'DOUBLE','ipp_lat':'DOUBLE','extra':'VARCHAR'}}, null_padding=true, ignore_errors=true, auto_detect=false)"
+                parsed_sql = csv_relation_sql(path)
                 seen = sum(1 for line in path.open('r', encoding='utf-8') if line.strip())
-                valid_expr = "time_h IS NOT NULL AND prn IS NOT NULL AND dtec IS NOT NULL AND azimuth IS NOT NULL AND elevation IS NOT NULL AND ipp_lon IS NOT NULL AND ipp_lat IS NOT NULL"
+                valid_expr = parsed_valid_expr(); prn_expr = normalized_prn_expr()
                 parsed = con.execute(f"SELECT COUNT(*) FROM {parsed_sql} WHERE {valid_expr}").fetchone()[0]
                 malformed += int(seen - parsed)
-                non_gps += int(con.execute(f"SELECT COUNT(*) FROM {parsed_sql} WHERE {valid_expr} AND NOT starts_with(prn, ?)", [filters.constellation_prefix]).fetchone()[0])
-                low_elev += int(con.execute(f"SELECT COUNT(*) FROM {parsed_sql} WHERE {valid_expr} AND starts_with(prn, ?) AND elevation < ?", [filters.constellation_prefix, filters.min_elevation_deg]).fetchone()[0])
-                out_bounds += int(con.execute(f"SELECT COUNT(*) FROM {parsed_sql} WHERE {valid_expr} AND starts_with(prn, ?) AND elevation >= ? AND NOT (ipp_lon BETWEEN ? AND ? AND ipp_lat BETWEEN ? AND ?)", [filters.constellation_prefix, filters.min_elevation_deg, filters.lon_min, filters.lon_max, filters.lat_min, filters.lat_max]).fetchone()[0])
+                non_gps += int(con.execute(f"SELECT COUNT(*) FROM {parsed_sql} WHERE {valid_expr} AND NOT starts_with({prn_expr}, upper(trim(?)))", [filters.constellation_prefix]).fetchone()[0])
+                low_elev += int(con.execute(f"SELECT COUNT(*) FROM {parsed_sql} WHERE {valid_expr} AND starts_with({prn_expr}, upper(trim(?))) AND elevation < ?", [filters.constellation_prefix, filters.min_elevation_deg]).fetchone()[0])
+                out_bounds += int(con.execute(f"SELECT COUNT(*) FROM {parsed_sql} WHERE {valid_expr} AND starts_with({prn_expr}, upper(trim(?))) AND elevation >= ? AND NOT (ipp_lon BETWEEN ? AND ? AND ipp_lat BETWEEN ? AND ?)", [filters.constellation_prefix, filters.min_elevation_deg, filters.lon_min, filters.lon_max, filters.lat_min, filters.lat_max]).fetchone()[0])
                 con.execute(f"INSERT INTO observations SELECT * FROM ({source_file_sql(path, station_from_filename(path), filters)})")
                 status = "imported"; err = ""
             except duckdb.Error as exc:
@@ -267,19 +324,24 @@ def build_manifest(folder: Path, cache_dir: Path, filters: ImportFilters | None 
             valid = int(after - before); total_seen += int(seen); valid_stored += valid
             con.execute("INSERT OR REPLACE INTO imported_files VALUES (?, ?, ?, ?, ?)", [path.name, int(seen), valid, status, err])
             con.execute("UPDATE metadata SET total_rows_seen=?, valid_rows_stored=?", [total_seen, valid_stored])
-            _progress(progress, "writing_database", valid_stored, max(valid_stored, 1), f"[3/6] Stored {valid_stored:,} filtered observations")
-        _progress(progress, "building_indexes", 0, 1, "[4/6] Building epoch table for GPS PRNs")
+            _progress(progress, "writing_database", valid_stored, max(valid_stored, 1), f"[4/7] Stored {valid_stored:,} filtered observations")
+        _progress(progress, "building_indexes", 0, 1, "[5/7] Building epoch table for GPS PRNs")
         finalize_cache(con)
-        _progress(progress, "building_indexes", 1, 1, "[4/6] Built epoch table and indexes")
-        _progress(progress, "visibility_arcs", 1, 1, "[5/6] Computing visibility arcs")
+        _progress(progress, "building_indexes", 1, 1, "[5/7] Built epoch table and indexes")
+        _progress(progress, "visibility_arcs", 1, 1, "[6/7] Computing visibility arcs")
+        if total_seen > 0 and valid_stored == 0:
+            con.execute("UPDATE metadata SET completed=false, total_rows_seen=?, valid_rows_stored=?", [total_seen, valid_stored])
+            raise RuntimeError("Unexpected empty import: source rows were read but zero valid observations were stored. Check import diagnostics and filters.")
         con.execute("UPDATE metadata SET completed=true, total_rows_seen=?, valid_rows_stored=?", [total_seen, valid_stored])
-    _progress(progress, "finalizing_cache", 1, 1, "[6/6] Finalizing manifest")
+    _progress(progress, "finalizing_cache", 1, 1, "[7/7] Finalizing manifest")
     manifest = _manifest_from_cache(folder, cache_path, filters)
     manifest["malformed_row_count"] = malformed
     manifest["non_gps_row_count"] = non_gps
     manifest["low_elevation_row_count"] = low_elev
     manifest["out_of_bounds_row_count"] = out_bounds
+    manifest["preflight"] = preflight
+    manifest["completed"] = bool(valid_stored > 0)
     cache_dir.mkdir(parents=True, exist_ok=True)
     (cache_dir / "day_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    _progress(progress, "done", 1, 1, "Done" if valid_stored else "Import completed, but no valid rows passed filters.")
+    _progress(progress, "done", 1, 1, "Done")
     return manifest
