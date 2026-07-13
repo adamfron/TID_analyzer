@@ -88,7 +88,8 @@ def test_preview_endpoint_snaps_current_epoch_to_nearest_available_time() -> Non
     assert data["requested_time_h"] == 0.02
     assert data["actual_time_h"] == 0.0
     assert data["count_returned"] == 1
-    assert data["station_markers"] == [{"station": "LAMA", "lon": 19.5, "lat": 50.1, "approximate": True, "source": "mean_epoch_ipp"}]
+    assert data["station_markers"][0]["station"] == "LAMA"
+    assert data["station_markers"][0]["approximate"] is False
     assert data["raster_available"] is False
     assert data["interpolated_dtec"] is None
 
@@ -433,3 +434,55 @@ def test_all_nonempty_rows_are_accounted_for(tmp_path: Path) -> None:
     diag = manifest["import_diagnostics"]
     assert diag["total_nonempty_rows"] == 5
     assert diag["malformed_rows"] + diag["non_gps_rows"] + diag["low_elevation_rows"] + diag["out_of_bounds_rows"] + diag["valid_rows_stored"] == diag["total_nonempty_rows"]
+
+
+def test_acor_filename_matches_bundled_euref_station() -> None:
+    from tid_analyzer.stations.catalog import resolve_stations, EUREF_SOURCE
+    rows = resolve_stations(["ACOR"], Path(".tid_analyzer_cache"), allow_download=False)
+    acor = rows[0]
+    assert acor.full_site_id == "ACOR00ESP"
+    assert acor.city == "A Coruna"
+    assert acor.country == "ESP"
+    assert acor.coordinate_source == EUREF_SOURCE
+    assert acor.resolved
+
+
+def test_bundled_csv_parsing_and_only_source_txt_stations_returned(tmp_path: Path) -> None:
+    import duckdb
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "ACOR_2024_246.txt").write_text("0;G01;1;1;80;-8;43\n", encoding="utf-8")
+    manifest = build_manifest(folder, tmp_path / "cache")
+    with duckdb.connect(str(manifest["cache_path"]), read_only=True) as con:
+        rows = con.execute("SELECT station, full_site_id, city, country FROM stations ORDER BY station").fetchall()
+    assert rows == [("ACOR", "ACOR00ESP", "A Coruna", "ESP")]
+
+
+def test_station_coordinates_remain_fixed_between_epochs_and_prn_filter(tmp_path: Path) -> None:
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "ACOR_2024_246.txt").write_text("0;G01;1;1;80;-1;40\n0.5;G01;1;1;80;20;60\n0.5;G02;1;1;80;30;70\n", encoding="utf-8")
+    manifest = build_manifest(folder, tmp_path / "cache")
+    state.source_folder = folder; state.manifest = manifest; state.cache_path = Path(str(manifest["cache_path"]))
+    client = TestClient(app)
+    first = client.get("/api/map/epoch?prn=G01&time_h=0").json()["station_markers"][0]
+    second = client.get("/api/map/epoch?prn=G01&time_h=0.5").json()["station_markers"][0]
+    g2 = client.get("/api/map/epoch?prn=G02&time_h=0.5").json()["station_markers"][0]
+    assert (first["lon"], first["lat"]) == (second["lon"], second["lat"]) == (g2["lon"], g2["lat"])
+    assert first["lon"] == -8.3989 and first["lat"] == 43.3644
+
+
+def test_frontend_load_epoch_button_wraps_handler_and_guards_events() -> None:
+    text = Path("frontend/src/main.tsx").read_text(encoding="utf-8")
+    assert "onClick={()=>p.loadPreview()}" in text
+    assert "typeof overrideTimeH === 'string' || typeof overrideTimeH === 'number'" in text
+    assert "const safePrn = typeof overridePrn === 'string'" in text
+
+
+def test_frontend_station_ipp_rays_and_plot_labels() -> None:
+    text = Path("frontend/src/main.tsx").read_text(encoding="utf-8")
+    assert "Show station–IPP rays" in text
+    assert "Station–IPP ray" in text
+    assert "x1={x(m.lon)}" in text and "x2={x(p.ipp_lon)}" in text
+    assert "const minD=-1, maxD=1" in text
+    assert "values outside displayed range [-1, 1] TECU" in text
+    assert "Period [min]" in text and "Amplitude [TECU]" in text
+    assert "Time [h UT]" in text and "Power" in text

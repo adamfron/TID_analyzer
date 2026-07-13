@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Any
 
 import numpy as np
@@ -120,10 +119,10 @@ async def station_catalog() -> dict[str, object]:
     cache_path = _require_cache_path()
     with connect_cache(cache_path) as con:
         try:
-            rows = con.execute("SELECT station, full_site_id, longitude, latitude, height, resolved, coordinate_source, resolution_note FROM stations ORDER BY station").fetchall()
+            rows = con.execute("SELECT station, full_site_id, city, country, domes, longitude, latitude, height, coordinate_source, resolved, resolution_note FROM stations ORDER BY station").fetchall()
         except Exception as exc:
             raise HTTPException(status_code=404, detail="Station catalogue is not available yet.") from exc
-    stations = [{"station": r[0], "full_site_id": r[1], "lon": r[2], "lat": r[3], "height": r[4], "resolved": bool(r[5]), "source": r[6], "resolution_note": r[7]} for r in rows]
+    stations = [{"station": r[0], "full_site_id": r[1], "city": r[2], "country": r[3], "domes": r[4], "lon": r[5], "lat": r[6], "height": r[7], "source": r[8], "resolved": bool(r[9]), "resolution_note": r[10]} for r in rows]
     resolved = sum(1 for s in stations if s["resolved"])
     return {"total": len(stations), "resolved": resolved, "unresolved": len(stations) - resolved, "stations": stations}
 
@@ -183,7 +182,7 @@ async def preview_points(
         tuples = con.execute(sql, params).fetchall()
     matching = [_row_from_tuple(t) for t in tuples]
     sampled, limit_reached = _deterministic_sample(matching, max_points)
-    station_markers = _station_markers(matching) if mode == "current_epoch" else []
+    station_markers = _catalog_station_markers(cache_path, sorted({r.station for r in matching})) if mode == "current_epoch" else _catalog_station_markers(cache_path, None)
     return {"points": [row.__dict__ for row in sampled], "station_markers": station_markers, "interpolated_dtec": None, "raster_available": False, "requested_time_h": time_h, "actual_time_h": actual_time_h, "count_returned": len(sampled), "total_matching_before_limit": len(matching), "limit_reached": limit_reached, "mode_used": mode}
 
 
@@ -214,22 +213,25 @@ async def satellite_visibility(gap_minutes: float = Query(10, gt=0)) -> dict[str
     return {"arcs": arcs}
 
 
-def _station_markers(rows: list[StationRow]) -> list[dict[str, object]]:
-    by_station: dict[str, list[StationRow]] = defaultdict(list)
-    for row in rows:
-        by_station[row.station].append(row)
-    markers: list[dict[str, object]] = []
-    for station in sorted(by_station):
-        station_rows = by_station[station]
-        markers.append({
-            "station": station,
-            "lon": sum(row.ipp_lon for row in station_rows) / len(station_rows),
-            "lat": sum(row.ipp_lat for row in station_rows) / len(station_rows),
-            "approximate": True,
-            "source": "mean_epoch_ipp",
-        })
-    return markers
-
+def _catalog_station_markers(cache_path: Path, station_codes: list[str] | None) -> list[dict[str, object]]:
+    params: list[object] = []
+    where = "resolved AND longitude IS NOT NULL AND latitude IS NOT NULL"
+    if station_codes is not None:
+        codes = sorted({code.upper() for code in station_codes})
+        if not codes:
+            return []
+        where += " AND UPPER(station) IN (" + ",".join("?" for _ in codes) + ")"
+        params.extend(codes)
+    with connect_cache(cache_path) as con:
+        rows = con.execute(f"""
+            SELECT station, full_site_id, city, country, domes, longitude, latitude, height, coordinate_source, resolution_note
+            FROM stations WHERE {where} ORDER BY station
+        """, params).fetchall()
+    return [{
+        "station": r[0], "full_site_id": r[1], "city": r[2], "country": r[3], "domes": r[4],
+        "lon": r[5], "lat": r[6], "height": r[7], "source": r[8], "resolved": True,
+        "resolution_note": r[9], "approximate": False,
+    } for r in rows]
 
 def _visibility_arc_from_epochs(prn: str, arc_index: int, rows: list[tuple[str, int, float, int, int]]) -> dict[str, object]:
     start = rows[0][2]
@@ -247,7 +249,7 @@ async def map_epoch(prn: str = Query(...), time_h: float = Query(...)) -> dict[s
         epoch_index, actual_time_h = int(epoch[0]), float(epoch[1])
         rows = con.execute("SELECT station, prn, time_h, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat FROM observations WHERE prn = ? AND epoch_index = ? ORDER BY station", [prn, epoch_index]).fetchall()
     points = [_row_from_tuple(t).__dict__ for t in rows]
-    return {"prn": prn, "requested_time_h": time_h, "actual_time_h": actual_time_h, "epoch_index": epoch_index, "points": points, "count": len(points), "stations": sorted({str(p["station"]) for p in points})}
+    return {"prn": prn, "requested_time_h": time_h, "actual_time_h": actual_time_h, "epoch_index": epoch_index, "points": points, "count": len(points), "stations": sorted({str(p["station"]) for p in points}), "station_markers": _catalog_station_markers(cache_path, sorted({str(p["station"]) for p in points}))}
 
 
 def _station_query_values(station: list[str]) -> list[str]:
