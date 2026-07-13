@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 import duckdb
 
@@ -12,78 +14,127 @@ if TYPE_CHECKING:
     from tid_analyzer.importer.parser import StationRow
 
 OBS_COLUMNS = "station, prn, time_h, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat"
+CACHE_VERSION = "duckdb_daily_v2"
 
 
 def epoch_index_for_time(time_h: float, step_seconds: int = 30) -> int:
     return round(time_h * 3600 / step_seconds)
 
 
-def cache_path_for_day(cache_root: Path, year: int | None, doy: int | None) -> Path:
+def elevation_key(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else str(value).replace(".", "p")
+
+
+def cache_path_for_day(cache_root: Path, year: int | None, doy: int | None, filters: ImportFilters | None = None) -> Path:
     name = f"{year}_{doy:03d}" if year is not None and doy is not None else "unknown_day"
-    return cache_root / name / "tid_day.duckdb"
+    elev = f"elev_{elevation_key((filters or ImportFilters()).min_elevation_deg)}"
+    return cache_root / name / elev / "tid_day.duckdb"
 
 
 def row_to_record(row: "StationRow", filters: ImportFilters) -> tuple[object, ...]:
     return (row.station, row.prn, row.time_h, epoch_index_for_time(row.time_h, filters.epoch_step_seconds), row.dtec, row.azimuth, row.elevation, row.ipp_lon, row.ipp_lat)
 
 
+def configure_connection(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute(f"PRAGMA threads={max(1, min(os.cpu_count() or 1, 8))}")
+
+
+def create_schema(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS observations (
+            station VARCHAR, prn VARCHAR, time_h DOUBLE, epoch_index INTEGER, dtec DOUBLE,
+            azimuth DOUBLE, elevation DOUBLE, ipp_lon DOUBLE, ipp_lat DOUBLE
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS imported_files (
+            filename VARCHAR PRIMARY KEY, row_count_seen INTEGER, valid_row_count INTEGER,
+            status VARCHAR, error_message VARCHAR
+        )
+    """)
+
+
+def create_metadata_table(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS metadata (
+            source_folder VARCHAR, year INTEGER, doy INTEGER, min_elevation_deg DOUBLE,
+            lon_min DOUBLE, lon_max DOUBLE, lat_min DOUBLE, lat_max DOUBLE,
+            source_file_count INTEGER, total_rows_seen BIGINT, valid_rows_stored BIGINT,
+            created_at VARCHAR, completed BOOLEAN, application_cache_version VARCHAR
+        )
+    """)
+
+
+def source_file_sql(path: Path, station: str, filters: ImportFilters) -> str:
+    safe_path = str(path).replace("'", "''")
+    safe_station = station.replace("'", "''")
+    return f"""
+        SELECT '{safe_station}'::VARCHAR AS station, prn, time_h,
+               CAST(ROUND(time_h * 3600.0 / {filters.epoch_step_seconds}) AS INTEGER) AS epoch_index,
+               dtec, azimuth, elevation, ipp_lon, ipp_lat
+        FROM read_csv('{safe_path}', delim=';', header=false, columns={{
+            'time_h':'DOUBLE','prn':'VARCHAR','dtec':'DOUBLE','azimuth':'DOUBLE',
+            'elevation':'DOUBLE','ipp_lon':'DOUBLE','ipp_lat':'DOUBLE','extra':'VARCHAR'
+        }}, null_padding=true, ignore_errors=true, auto_detect=false)
+        WHERE starts_with(prn, '{filters.constellation_prefix}')
+          AND elevation >= {filters.min_elevation_deg}
+          AND ipp_lon BETWEEN {filters.lon_min} AND {filters.lon_max}
+          AND ipp_lat BETWEEN {filters.lat_min} AND {filters.lat_max}
+    """
+
+
+def finalize_cache(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute("DROP TABLE IF EXISTS epochs")
+    con.execute("""
+        CREATE TABLE epochs AS
+        SELECT prn, epoch_index, AVG(time_h) AS time_h, COUNT(*) AS row_count, COUNT(DISTINCT station) AS station_count
+        FROM observations GROUP BY prn, epoch_index
+    """)
+    con.execute("DROP VIEW IF EXISTS prn_epochs")
+    con.execute("CREATE VIEW prn_epochs AS SELECT * FROM epochs")
+    for stmt in [
+        "CREATE INDEX IF NOT EXISTS idx_observations_prn ON observations(prn)",
+        "CREATE INDEX IF NOT EXISTS idx_observations_station ON observations(station)",
+        "CREATE INDEX IF NOT EXISTS idx_observations_time_h ON observations(time_h)",
+        "CREATE INDEX IF NOT EXISTS idx_observations_prn_time ON observations(prn, time_h)",
+        "CREATE INDEX IF NOT EXISTS idx_observations_station_prn ON observations(station, prn)",
+        "CREATE INDEX IF NOT EXISTS idx_epochs_prn_epoch ON epochs(prn, epoch_index)",
+    ]:
+        try:
+            con.execute(stmt)
+        except duckdb.Error:
+            pass
+
+
+def cache_is_valid(cache_path: Path, folder: Path, files: list[Path], year: int | None, doy: int | None, filters: ImportFilters) -> bool:
+    if not cache_path.exists():
+        return False
+    try:
+        with duckdb.connect(str(cache_path), read_only=True) as con:
+            row = con.execute("SELECT source_folder, year, doy, min_elevation_deg, lon_min, lon_max, lat_min, lat_max, source_file_count, completed, application_cache_version FROM metadata LIMIT 1").fetchone()
+            if row is None:
+                return False
+            return (
+                Path(str(row[0])) == folder and row[1] == year and row[2] == doy
+                and float(row[3]) == float(filters.min_elevation_deg)
+                and float(row[4]) == filters.lon_min and float(row[5]) == filters.lon_max
+                and float(row[6]) == filters.lat_min and float(row[7]) == filters.lat_max
+                and int(row[8]) == len(files) and bool(row[9]) and str(row[10]) == CACHE_VERSION
+            )
+    except duckdb.Error:
+        return False
+
+
 def create_daily_cache(cache_path: Path, rows: Iterable["StationRow"], metadata: dict[str, object], filters: ImportFilters) -> None:
+    # Reference/fallback implementation retained for tests and malformed files.
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     if cache_path.exists():
         cache_path.unlink()
     with duckdb.connect(str(cache_path)) as con:
-        con.execute("""
-            CREATE TABLE observations (
-                station TEXT,
-                prn TEXT,
-                time_h DOUBLE,
-                epoch_index INTEGER,
-                dtec DOUBLE,
-                azimuth DOUBLE,
-                elevation DOUBLE,
-                ipp_lon DOUBLE,
-                ipp_lat DOUBLE
-            )
-        """)
-        batch: list[tuple[object, ...]] = []
-        for row in rows:
-            batch.append(row_to_record(row, filters))
-            if len(batch) >= 10000:
-                con.executemany(f"INSERT INTO observations ({OBS_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
-                batch.clear()
-        if batch:
-            con.executemany(f"INSERT INTO observations ({OBS_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
-        con.execute("""
-            CREATE TABLE prn_epochs AS
-            SELECT prn, epoch_index, AVG(time_h) AS time_h, COUNT(*) AS row_count, COUNT(DISTINCT station) AS station_count
-            FROM observations
-            GROUP BY prn, epoch_index
-        """)
-        enriched = dict(metadata)
-        enriched["created_at"] = datetime.now(timezone.utc).isoformat()
-        enriched["filters"] = json.dumps(filters.as_manifest_dict(), sort_keys=True)
-        con.execute("""
-            CREATE TABLE metadata (
-                source_folder TEXT, year INTEGER, doy INTEGER, min_time_h DOUBLE, max_time_h DOUBLE,
-                station_count INTEGER, prn_count INTEGER, valid_rows INTEGER, created_at TEXT, filters TEXT
-            )
-        """)
-        con.execute(
-            "INSERT INTO metadata VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [enriched.get("source_folder"), enriched.get("year"), enriched.get("doy"), enriched.get("min_time_h"), enriched.get("max_time_h"), enriched.get("station_count"), enriched.get("prn_count"), enriched.get("valid_rows"), enriched.get("created_at"), enriched.get("filters")],
-        )
-        for stmt in [
-            "CREATE INDEX idx_observations_prn ON observations(prn)",
-            "CREATE INDEX idx_observations_station ON observations(station)",
-            "CREATE INDEX idx_observations_time_h ON observations(time_h)",
-            "CREATE INDEX idx_observations_prn_time ON observations(prn, time_h)",
-            "CREATE INDEX idx_observations_station_prn ON observations(station, prn)",
-            "CREATE INDEX idx_prn_epochs_prn_epoch ON prn_epochs(prn, epoch_index)",
-        ]:
-            try:
-                con.execute(stmt)
-            except duckdb.Error:
-                pass
+        configure_connection(con); create_schema(con); create_metadata_table(con)
+        con.executemany(f"INSERT INTO observations ({OBS_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [row_to_record(r, filters) for r in rows])
+        finalize_cache(con)
+        con.execute("INSERT INTO metadata VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [metadata.get("source_folder"), metadata.get("year"), metadata.get("doy"), filters.min_elevation_deg, filters.lon_min, filters.lon_max, filters.lat_min, filters.lat_max, metadata.get("source_file_count", 0), metadata.get("total_rows_seen", 0), metadata.get("valid_rows", 0), datetime.now(timezone.utc).isoformat(), True, CACHE_VERSION])
 
 
 def connect_cache(cache_path: Path) -> duckdb.DuckDBPyConnection:
