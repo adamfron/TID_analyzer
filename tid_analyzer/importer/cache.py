@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from tid_analyzer.importer.parser import StationRow
 
 OBS_COLUMNS = "station, prn, time_h, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat"
-CACHE_VERSION = "duckdb_daily_v3"
+CACHE_VERSION = "duckdb_daily_v4"
 
 
 def epoch_index_for_time(time_h: float, step_seconds: int = 30) -> int:
@@ -48,8 +48,16 @@ def create_schema(con: duckdb.DuckDBPyConnection) -> None:
     """)
     con.execute("""
         CREATE TABLE IF NOT EXISTS imported_files (
-            filename VARCHAR PRIMARY KEY, row_count_seen INTEGER, valid_row_count INTEGER,
-            status VARCHAR, error_message VARCHAR
+            filename VARCHAR PRIMARY KEY,
+            total_nonempty_rows BIGINT,
+            parsed_rows BIGINT,
+            malformed_rows BIGINT,
+            non_gps_rows BIGINT,
+            low_elevation_rows BIGINT,
+            out_of_bounds_rows BIGINT,
+            valid_row_count BIGINT,
+            status VARCHAR,
+            error_message VARCHAR
         )
     """)
     con.execute("""
@@ -74,15 +82,35 @@ def create_metadata_table(con: duckdb.DuckDBPyConnection) -> None:
 
 def csv_relation_sql(path: Path) -> str:
     safe_path = str(path).replace("'", "''")
-    return f"read_csv('{safe_path}', delim=';', header=false, columns={{'time_h':'DOUBLE','prn':'VARCHAR','dtec':'DOUBLE','azimuth':'DOUBLE','elevation':'DOUBLE','ipp_lon':'DOUBLE','ipp_lat':'DOUBLE','extra':'VARCHAR'}}, null_padding=true, ignore_errors=true, auto_detect=false)"
+    return (
+        f"read_csv('{safe_path}', delim=';', header=false, "
+        "columns={'time_raw':'VARCHAR','prn_raw':'VARCHAR','dtec_raw':'VARCHAR',"
+        "'azimuth_raw':'VARCHAR','elevation_raw':'VARCHAR','ipp_lon_raw':'VARCHAR',"
+        "'ipp_lat_raw':'VARCHAR','extra_raw':'VARCHAR'}, null_padding=true, auto_detect=false)"
+    )
+
+
+def parsed_relation_sql(path: Path) -> str:
+    return f"""
+        SELECT
+            TRY_CAST(trim(time_raw) AS DOUBLE) AS time_h,
+            upper(trim(prn_raw)) AS prn,
+            TRY_CAST(trim(dtec_raw) AS DOUBLE) AS dtec,
+            TRY_CAST(trim(azimuth_raw) AS DOUBLE) AS azimuth,
+            TRY_CAST(trim(elevation_raw) AS DOUBLE) AS elevation,
+            TRY_CAST(trim(ipp_lon_raw) AS DOUBLE) AS ipp_lon,
+            TRY_CAST(trim(ipp_lat_raw) AS DOUBLE) AS ipp_lat,
+            extra_raw
+        FROM {csv_relation_sql(path)}
+    """
 
 
 def parsed_valid_expr() -> str:
-    return "time_h IS NOT NULL AND prn IS NOT NULL AND dtec IS NOT NULL AND azimuth IS NOT NULL AND elevation IS NOT NULL AND ipp_lon IS NOT NULL AND ipp_lat IS NOT NULL AND (extra IS NULL OR trim(extra) = '')"
+    return "time_h IS NOT NULL AND prn IS NOT NULL AND dtec IS NOT NULL AND azimuth IS NOT NULL AND elevation IS NOT NULL AND ipp_lon IS NOT NULL AND ipp_lat IS NOT NULL AND (extra_raw IS NULL OR trim(extra_raw) = '')"
 
 
 def normalized_prn_expr() -> str:
-    return "upper(trim(prn))"
+    return "prn"
 
 
 def source_file_sql(path: Path, station: str, filters: ImportFilters) -> str:
@@ -92,7 +120,7 @@ def source_file_sql(path: Path, station: str, filters: ImportFilters) -> str:
         SELECT trim('{safe_station}')::VARCHAR AS station, {prn} AS prn, time_h,
                CAST(ROUND(time_h * 3600.0 / {filters.epoch_step_seconds}) AS INTEGER) AS epoch_index,
                dtec, azimuth, elevation, ipp_lon, ipp_lat
-        FROM {csv_relation_sql(path)}
+        FROM ({parsed_relation_sql(path)})
         WHERE {parsed_valid_expr()}
           AND starts_with({prn}, upper(trim('{filters.constellation_prefix}')))
           AND elevation >= {filters.min_elevation_deg}

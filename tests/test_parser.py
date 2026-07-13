@@ -30,9 +30,13 @@ def test_parser_accepts_no_trailing_semicolon_rows(tmp_path: Path) -> None:
 def test_parser_rejects_truly_malformed_rows(tmp_path: Path) -> None:
     folder = tmp_path / "day"; folder.mkdir()
     (folder / "TEST_2024_246.txt").write_text("malformed;G01;bad\n", encoding="utf-8")
-    manifest = build_manifest(folder, tmp_path / "cache")
-    assert manifest["malformed_row_count"] == 1
-    assert manifest["valid_rows_after_filters"] == 0
+    try:
+        build_manifest(folder, tmp_path / "cache")
+    except RuntimeError as exc:
+        assert "No valid observations passed" in str(exc)
+        assert "malformed: 1" in str(exc)
+    else:
+        raise AssertionError("zero-valid malformed import should fail")
 
 
 def test_manifest_collects_filtered_metadata(tmp_path: Path) -> None:
@@ -307,19 +311,18 @@ def test_duckdb_import_normalizes_prn_whitespace_and_trailing_semicolon(tmp_path
         assert con.execute("SELECT list(prn ORDER BY prn) FROM observations").fetchone()[0] == ["G12", "G24"]
 
 
-def test_preflight_reports_raw_prns_when_no_gps_rows(tmp_path: Path) -> None:
-    from tid_analyzer.importer.parser import preflight_validate
+def test_zero_valid_import_reports_full_day_counts(tmp_path: Path) -> None:
     folder = tmp_path / "day"; folder.mkdir()
-    path = folder / "LAMA_2024_246.txt"
-    path.write_text("0; R24 ;1;120;70;21;51\n", encoding="utf-8")
+    (folder / "LAMA_2024_246.txt").write_text("0; R24 ;1;120;70;21;51\n", encoding="utf-8")
     try:
-        preflight_validate([path], ImportFilters())
-    except ValueError as exc:
-        assert "No sampled rows passed the GPS filter" in str(exc)
-        assert " R24 " in str(exc)
+        build_manifest(folder, tmp_path / "cache")
+    except RuntimeError as exc:
+        detail = str(exc)
+        assert "No valid observations passed the full import filters" in detail
+        assert "Parsed: 1" in detail
+        assert "GPS: 0" in detail
     else:
-        raise AssertionError("preflight should fail")
-
+        raise AssertionError("zero-valid import should fail")
 
 def test_zero_valid_cache_is_not_reused(tmp_path: Path) -> None:
     import duckdb
@@ -343,3 +346,90 @@ def test_station_code_extraction_and_catalog_matching(tmp_path: Path) -> None:
     odd = next(r for r in rows if r.station == "ODDNAME")
     assert lama.resolved and lama.full_site_id == "LAMA00POL"
     assert not odd.resolved
+
+
+def test_exact_requested_row_field_mapping_and_filters() -> None:
+    from tid_analyzer.importer.parser import parse_row
+
+    row = parse_row("0.0; G28; 0.21664; -131.80717; 76.60443; -9.11857; 42.69704;", "TEST")
+    assert row is not None
+    assert row.elevation == 76.60443
+    assert row.ipp_lon == -9.11857
+    assert row.ipp_lat == 42.69704
+    assert row.elevation >= 40
+    assert row.elevation >= 50
+    assert -20 <= row.ipp_lon <= 50
+    assert 20 <= row.ipp_lat <= 80
+
+
+def test_full_import_does_not_abort_before_later_high_elevation_row(tmp_path: Path) -> None:
+    import duckdb
+
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "EARLY_2024_246.txt").write_text("".join(f"{i};G01;1;1;30;10;50\n" for i in range(150)), encoding="utf-8")
+    (folder / "LATE_2024_246.txt").write_text("0.0; G28; 0.21664; -131.80717; 76.60443; -9.11857; 42.69704;\n", encoding="utf-8")
+    manifest = build_manifest(folder, tmp_path / "cache", ImportFilters(min_elevation_deg=50))
+    assert manifest["valid_rows_after_filters"] == 1
+    assert manifest["low_elevation_row_count"] == 150
+    with duckdb.connect(str(manifest["cache_path"]), read_only=True) as con:
+        assert con.execute("SELECT prn, elevation, ipp_lon, ipp_lat FROM observations").fetchone() == ("G28", 76.60443, -9.11857, 42.69704)
+
+
+def test_file_with_single_valid_high_elevation_observation_is_stored(tmp_path: Path) -> None:
+    import duckdb
+
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "ONLY_2024_246.txt").write_text("0.0; G28; 0.21664; -131.80717; 76.60443; -9.11857; 42.69704;\n", encoding="utf-8")
+    manifest = build_manifest(folder, tmp_path / "cache", ImportFilters(min_elevation_deg=50))
+    with duckdb.connect(str(manifest["cache_path"]), read_only=True) as con:
+        assert con.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
+        assert con.execute("SELECT valid_row_count FROM imported_files WHERE filename='ONLY_2024_246.txt'").fetchone()[0] == 1
+
+
+def test_python_fallback_and_duckdb_counter_parity(tmp_path: Path) -> None:
+    import duckdb
+    from tid_analyzer.importer.cache import configure_connection, create_schema, source_file_sql
+    from tid_analyzer.importer.parser import _count_duckdb_file, _fallback_import_file, station_from_filename
+
+    folder = tmp_path / "day"; folder.mkdir()
+    path = folder / "PARI_2024_246.txt"
+    path.write_text(
+        "0;G01;1;1;80;10;50\n"
+        "0;R01;1;1;80;10;50\n"
+        "0;G02;1;1;30;10;50\n"
+        "0;G03;1;1;80;99;50\n"
+        "bad;G04;1;1;80;10;50\n",
+        encoding="utf-8",
+    )
+    filters = ImportFilters(min_elevation_deg=50)
+    with duckdb.connect(str(tmp_path / "duck.duckdb")) as con:
+        configure_connection(con); create_schema(con)
+        duck_counts = _count_duckdb_file(con, path, filters)
+        con.execute(f"INSERT INTO observations SELECT * FROM ({source_file_sql(path, station_from_filename(path), filters)})")
+        duck_counts.valid_rows_stored = con.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+    with duckdb.connect(str(tmp_path / "py.duckdb")) as con:
+        configure_connection(con); create_schema(con)
+        py_counts = _fallback_import_file(con, path, filters)
+    assert duck_counts.total_nonempty_rows == py_counts.total_nonempty_rows == 5
+    assert duck_counts.parsed_rows == py_counts.parsed_rows == 4
+    assert duck_counts.malformed_rows == py_counts.malformed_rows == 1
+    assert duck_counts.non_gps_rows == py_counts.non_gps_rows == 1
+    assert duck_counts.low_elevation_rows == py_counts.low_elevation_rows == 1
+    assert duck_counts.out_of_bounds_rows == py_counts.out_of_bounds_rows == 1
+
+
+def test_all_nonempty_rows_are_accounted_for(tmp_path: Path) -> None:
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "ACCT_2024_246.txt").write_text(
+        "\n"
+        "0;G01;1;1;80;10;50\n"
+        "0;R01;1;1;80;10;50\n"
+        "0;G02;1;1;30;10;50\n"
+        "0;G03;1;1;80;99;50\n"
+        "bad;G04;1;1;80;10;50\n",
+        encoding="utf-8",
+    )
+    manifest = build_manifest(folder, tmp_path / "cache")
+    diag = manifest["import_diagnostics"]
+    assert diag["total_nonempty_rows"] == 5
+    assert diag["malformed_rows"] + diag["non_gps_rows"] + diag["low_elevation_rows"] + diag["out_of_bounds_rows"] + diag["valid_rows_stored"] == diag["total_nonempty_rows"]
