@@ -96,3 +96,8 @@ summary { cursor: pointer; color: #2f435b; font-weight: 700; }
 .seriesLarge { min-height: 460px; }
 .modalPlot { overflow:auto; }
 .modalPlot h2 { margin:0; color:#24364b; }
+.compactInput { display:flex; align-items:center; gap:5px; font-size:12px; color:#344963; }
+.compactInput input { flex:0 0 58px; min-width:58px; width:58px; padding:6px 5px; }
+.progressStack { display:grid; gap:2px; }
+.progressStack progress { display:block; }
+.stageProgress { height:5px; }

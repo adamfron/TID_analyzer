@@ -244,3 +244,53 @@ def test_spectral_endpoint_reports_short_series(tmp_path: Path) -> None:
     response = TestClient(app).post("/api/spectral/fft", json={"station": "LAMA", "prn": "G24"})
     assert response.status_code == 400
     assert "At least four observations" in response.json()["detail"]
+
+
+def test_selected_elevation_is_applied_before_rows_are_stored(tmp_path: Path) -> None:
+    import duckdb
+    from tid_analyzer.config import ImportFilters
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "TEST_2024_246.txt").write_text("0;G01;1;1;49;10;50\n0;G02;1;1;75;10;50\n", encoding="utf-8")
+    manifest = build_manifest(folder, tmp_path / "cache", ImportFilters(min_elevation_deg=70))
+    with duckdb.connect(str(manifest["cache_path"]), read_only=True) as con:
+        assert con.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
+        assert con.execute("SELECT MIN(elevation) FROM observations").fetchone()[0] >= 70
+
+
+def test_progress_events_include_stage_fields(tmp_path: Path) -> None:
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "TEST_2024_246.txt").write_text("0;G01;1;1;80;10;50\n", encoding="utf-8")
+    events = []
+    state.cache_dir = tmp_path / "cache"
+    update = state._format_update("reading_filtering", 1, 2, "message")
+    assert {"stage_index", "stage_count", "current", "total", "stage_percent", "overall_percent"} <= set(update)
+    build_manifest(folder, tmp_path / "cache", progress=lambda *args: events.append(args))
+    assert any(event[0] == "reading_filtering" and event[1] == 1 and event[2] == 1 for event in events)
+
+
+def test_incomplete_cache_is_not_reused_but_completed_cache_is(tmp_path: Path) -> None:
+    import duckdb
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "TEST_2024_246.txt").write_text("0;G01;1;1;80;10;50\n", encoding="utf-8")
+    first = build_manifest(folder, tmp_path / "cache")
+    second = build_manifest(folder, tmp_path / "cache")
+    assert second["cache_path"] == first["cache_path"]
+    with duckdb.connect(str(first["cache_path"])) as con:
+        con.execute("UPDATE metadata SET completed=false")
+    (folder / "NEXT_2024_246.txt").write_text("0;G02;1;1;80;10;50\n", encoding="utf-8")
+    rebuilt = build_manifest(folder, tmp_path / "cache")
+    assert rebuilt["valid_rows_after_filters"] == 2
+
+
+def test_cancel_marks_cache_incomplete(tmp_path: Path) -> None:
+    import duckdb
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "TEST_2024_246.txt").write_text("0;G01;1;1;80;10;50\n", encoding="utf-8")
+    try:
+        build_manifest(folder, tmp_path / "cache", cancel=lambda: True)
+    except RuntimeError as exc:
+        assert "cancelled" in str(exc).lower()
+    dbs = list((tmp_path / "cache").glob("**/tid_day.duckdb"))
+    assert dbs
+    with duckdb.connect(str(dbs[0]), read_only=True) as con:
+        assert con.execute("SELECT completed FROM metadata").fetchone()[0] is False

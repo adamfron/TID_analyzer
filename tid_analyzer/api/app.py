@@ -27,6 +27,7 @@ state = ImportState()
 
 class ImportRequest(BaseModel):
     folder_path: str
+    min_elevation_deg: float = 50.0
 
 
 class SpectralRequest(BaseModel):
@@ -86,12 +87,20 @@ def _deterministic_sample(rows: list[StationRow], max_points: int) -> tuple[list
 
 
 @app.post("/api/import")
-async def start_import(request: ImportRequest) -> dict[str, str]:
+async def start_import(request: ImportRequest, force_rebuild: bool = False) -> dict[str, str]:
+    if request.min_elevation_deg < 0 or request.min_elevation_deg > 90:
+        raise HTTPException(status_code=400, detail="min_elevation_deg must be between 0 and 90.")
     try:
-        await state.start_import(Path(request.folder_path).expanduser())
+        await state.start_import(Path(request.folder_path).expanduser(), ImportFilters(min_elevation_deg=request.min_elevation_deg), force_rebuild)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"message": "Import started"}
+
+
+@app.post("/api/import/cancel")
+async def cancel_import() -> dict[str, str]:
+    await state.cancel_import()
+    return {"message": "Import cancellation requested"}
 
 
 @app.get("/api/import/status")
