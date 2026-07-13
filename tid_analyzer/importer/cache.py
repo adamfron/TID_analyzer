@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from tid_analyzer.importer.parser import StationRow
 
 OBS_COLUMNS = "station, prn, time_h, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat"
-CACHE_VERSION = "duckdb_daily_v2"
+CACHE_VERSION = "duckdb_daily_v3"
 
 
 def epoch_index_for_time(time_h: float, step_seconds: int = 30) -> int:
@@ -52,6 +52,13 @@ def create_schema(con: duckdb.DuckDBPyConnection) -> None:
             status VARCHAR, error_message VARCHAR
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS stations (
+            station VARCHAR PRIMARY KEY, full_site_id VARCHAR, longitude DOUBLE, latitude DOUBLE,
+            height DOUBLE, x DOUBLE, y DOUBLE, z DOUBLE, coordinate_source VARCHAR,
+            reference_frame VARCHAR, coordinate_epoch VARCHAR, resolved BOOLEAN, resolution_note VARCHAR
+        )
+    """)
 
 
 def create_metadata_table(con: duckdb.DuckDBPyConnection) -> None:
@@ -65,18 +72,29 @@ def create_metadata_table(con: duckdb.DuckDBPyConnection) -> None:
     """)
 
 
-def source_file_sql(path: Path, station: str, filters: ImportFilters) -> str:
+def csv_relation_sql(path: Path) -> str:
     safe_path = str(path).replace("'", "''")
+    return f"read_csv('{safe_path}', delim=';', header=false, columns={{'time_h':'DOUBLE','prn':'VARCHAR','dtec':'DOUBLE','azimuth':'DOUBLE','elevation':'DOUBLE','ipp_lon':'DOUBLE','ipp_lat':'DOUBLE','extra':'VARCHAR'}}, null_padding=true, ignore_errors=true, auto_detect=false)"
+
+
+def parsed_valid_expr() -> str:
+    return "time_h IS NOT NULL AND prn IS NOT NULL AND dtec IS NOT NULL AND azimuth IS NOT NULL AND elevation IS NOT NULL AND ipp_lon IS NOT NULL AND ipp_lat IS NOT NULL AND (extra IS NULL OR trim(extra) = '')"
+
+
+def normalized_prn_expr() -> str:
+    return "upper(trim(prn))"
+
+
+def source_file_sql(path: Path, station: str, filters: ImportFilters) -> str:
     safe_station = station.replace("'", "''")
+    prn = normalized_prn_expr()
     return f"""
-        SELECT '{safe_station}'::VARCHAR AS station, prn, time_h,
+        SELECT trim('{safe_station}')::VARCHAR AS station, {prn} AS prn, time_h,
                CAST(ROUND(time_h * 3600.0 / {filters.epoch_step_seconds}) AS INTEGER) AS epoch_index,
                dtec, azimuth, elevation, ipp_lon, ipp_lat
-        FROM read_csv('{safe_path}', delim=';', header=false, columns={{
-            'time_h':'DOUBLE','prn':'VARCHAR','dtec':'DOUBLE','azimuth':'DOUBLE',
-            'elevation':'DOUBLE','ipp_lon':'DOUBLE','ipp_lat':'DOUBLE','extra':'VARCHAR'
-        }}, null_padding=true, ignore_errors=true, auto_detect=false)
-        WHERE starts_with(prn, '{filters.constellation_prefix}')
+        FROM {csv_relation_sql(path)}
+        WHERE {parsed_valid_expr()}
+          AND starts_with({prn}, upper(trim('{filters.constellation_prefix}')))
           AND elevation >= {filters.min_elevation_deg}
           AND ipp_lon BETWEEN {filters.lon_min} AND {filters.lon_max}
           AND ipp_lat BETWEEN {filters.lat_min} AND {filters.lat_max}
@@ -111,7 +129,7 @@ def cache_is_valid(cache_path: Path, folder: Path, files: list[Path], year: int 
         return False
     try:
         with duckdb.connect(str(cache_path), read_only=True) as con:
-            row = con.execute("SELECT source_folder, year, doy, min_elevation_deg, lon_min, lon_max, lat_min, lat_max, source_file_count, completed, application_cache_version FROM metadata LIMIT 1").fetchone()
+            row = con.execute("SELECT source_folder, year, doy, min_elevation_deg, lon_min, lon_max, lat_min, lat_max, source_file_count, completed, application_cache_version, valid_rows_stored FROM metadata LIMIT 1").fetchone()
             if row is None:
                 return False
             return (
@@ -119,7 +137,7 @@ def cache_is_valid(cache_path: Path, folder: Path, files: list[Path], year: int 
                 and float(row[3]) == float(filters.min_elevation_deg)
                 and float(row[4]) == filters.lon_min and float(row[5]) == filters.lon_max
                 and float(row[6]) == filters.lat_min and float(row[7]) == filters.lat_max
-                and int(row[8]) == len(files) and bool(row[9]) and str(row[10]) == CACHE_VERSION
+                and int(row[8]) == len(files) and bool(row[9]) and str(row[10]) == CACHE_VERSION and int(row[11] or 0) > 0
             )
     except duckdb.Error:
         return False

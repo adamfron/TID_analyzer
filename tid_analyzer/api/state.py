@@ -7,25 +7,29 @@ from pathlib import Path
 from typing import Any
 
 from tid_analyzer.config import ImportFilters
-from tid_analyzer.importer.parser import build_manifest
+from tid_analyzer.importer.parser import build_manifest, iter_station_files, _detect_day
+from tid_analyzer.importer.cache import cache_path_for_day
 
 STAGES = {
     "scanning_files": (1, "Scanning files"),
-    "reading_filtering": (2, "Reading and filtering source files"),
-    "writing_database": (3, "Writing daily database"),
-    "building_indexes": (4, "Building PRN/epoch indexes"),
-    "visibility_arcs": (5, "Computing satellite visibility arcs"),
-    "finalizing_cache": (6, "Finalizing cache"),
-    "done": (6, "Finalizing cache"),
-    "error": (6, "Finalizing cache"),
-    "cancelled": (6, "Finalizing cache"),
+    "resolving_stations": (2, "Resolving station coordinates"),
+    "stations_resolved": (2, "Resolving station coordinates"),
+    "validating_input": (3, "Validating input format and filters"),
+    "reading_filtering": (4, "Reading and filtering source files"),
+    "writing_database": (4, "Reading and filtering source files"),
+    "building_indexes": (5, "Building daily database indexes"),
+    "visibility_arcs": (6, "Computing satellite visibility arcs"),
+    "finalizing_cache": (7, "Finalizing cache"),
+    "done": (7, "Finalizing cache"),
+    "error": (7, "Finalizing cache"),
+    "cancelled": (7, "Finalizing cache"),
 }
 
 
 @dataclass
 class ImportState:
     cache_dir: Path = field(default_factory=lambda: Path(".tid_analyzer_cache"))
-    status: dict[str, Any] = field(default_factory=lambda: {"stage": "idle", "stage_index": 0, "stage_count": 6, "stage_name": "Idle", "current": 0, "total": 0, "percent": 0, "stage_percent": 0, "overall_percent": 0, "message": "Idle"})
+    status: dict[str, Any] = field(default_factory=lambda: {"stage": "idle", "stage_index": 0, "stage_count": 7, "stage_name": "Idle", "current": 0, "total": 0, "percent": 0, "stage_percent": 0, "overall_percent": 0, "message": "Idle"})
     manifest: dict[str, Any] | None = None
     source_folder: Path | None = None
     cache_path: Path | None = None
@@ -40,10 +44,10 @@ class ImportState:
     def _format_update(self, stage: str, current: int, total: int, message: str) -> dict[str, Any]:
         idx, name = STAGES.get(stage, (0, stage.replace("_", " ").title()))
         stage_percent = round((current / total) * 100, 1) if total else 0
-        overall_percent = round(((idx - 1) / 6 + (stage_percent / 100) / 6) * 100, 1) if idx else stage_percent
+        overall_percent = round(((idx - 1) / 7 + (stage_percent / 100) / 7) * 100, 1) if idx else stage_percent
         if stage == "done":
             stage_percent = overall_percent = 100
-        return {"stage": stage, "stage_index": idx, "stage_count": 6, "stage_name": name, "current": current, "total": total, "percent": overall_percent, "stage_percent": stage_percent, "overall_percent": overall_percent, "message": message}
+        return {"stage": stage, "stage_index": idx, "stage_count": 7, "stage_name": name, "current": current, "total": total, "percent": overall_percent, "stage_percent": stage_percent, "overall_percent": overall_percent, "message": message}
 
     async def start_import(self, folder: Path, filters: ImportFilters | None = None, force_rebuild: bool = False) -> None:
         if self.task and not self.task.done():
@@ -59,6 +63,14 @@ class ImportState:
 
     async def _run_import(self, folder: Path, filters: ImportFilters, force_rebuild: bool) -> None:
         loop = asyncio.get_running_loop()
+        self.source_folder = folder
+        try:
+            files = iter_station_files(folder); years, doys = _detect_day(files)
+            year = next(iter(years)) if len(years) == 1 else None
+            doy = next(iter(doys)) if len(doys) == 1 else None
+            self.cache_path = cache_path_for_day(self.cache_dir, year, doy, filters)
+        except Exception:
+            self.cache_path = None
 
         def progress(stage: str, current: int, total: int, message: str) -> None:
             asyncio.run_coroutine_threadsafe(self.publish(self._format_update(stage, current, total, message)), loop)

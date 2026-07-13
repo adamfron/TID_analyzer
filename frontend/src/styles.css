@@ -101,3 +101,14 @@ summary { cursor: pointer; color: #2f435b; font-weight: 700; }
 .progressStack { display:grid; gap:2px; }
 .progressStack progress { display:block; }
 .stageProgress { height:5px; }
+.topbar { display:grid; grid-template-columns: auto minmax(300px, 1fr) 90px 170px 82px 150px minmax(340px, 340px) 18px; gap:9px; }
+.folderInput { width:100%; min-width:0; }
+.browseSlot, .importSlot { display:block; width:90px; }
+.browseSlot button, .importSlot button { width:100%; }
+.compactInput { width:170px; justify-content:flex-end; }
+.progressStack { width:150px; }
+.progressStack progress { width:150px; }
+.statusText { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-variant-numeric: tabular-nums; }
+.spinnerSlot { width:18px; height:18px; display:flex; align-items:center; justify-content:center; }
+.spinnerSlot:empty { visibility:hidden; }
+.topbar, .topbar * { font-variant-numeric: tabular-nums; }

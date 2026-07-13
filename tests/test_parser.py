@@ -3,7 +3,8 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from tid_analyzer.api.app import app, state
-from tid_analyzer.importer.parser import build_manifest, station_from_filename
+from tid_analyzer.config import ImportFilters
+from tid_analyzer.importer.parser import build_manifest, station_from_filename, iter_station_files
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -294,3 +295,51 @@ def test_cancel_marks_cache_incomplete(tmp_path: Path) -> None:
     assert dbs
     with duckdb.connect(str(dbs[0]), read_only=True) as con:
         assert con.execute("SELECT completed FROM metadata").fetchone()[0] is False
+
+
+def test_duckdb_import_normalizes_prn_whitespace_and_trailing_semicolon(tmp_path: Path) -> None:
+    import duckdb
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "LAMA_2024_246.txt").write_text("0; G24 ;1;120;70;21;51;\n0;g12;1;120;70;22;52\n", encoding="utf-8")
+    manifest = build_manifest(folder, tmp_path / "cache")
+    assert manifest["valid_rows_after_filters"] == 2
+    with duckdb.connect(str(manifest["cache_path"]), read_only=True) as con:
+        assert con.execute("SELECT list(prn ORDER BY prn) FROM observations").fetchone()[0] == ["G12", "G24"]
+
+
+def test_preflight_reports_raw_prns_when_no_gps_rows(tmp_path: Path) -> None:
+    from tid_analyzer.importer.parser import preflight_validate
+    folder = tmp_path / "day"; folder.mkdir()
+    path = folder / "LAMA_2024_246.txt"
+    path.write_text("0; R24 ;1;120;70;21;51\n", encoding="utf-8")
+    try:
+        preflight_validate([path], ImportFilters())
+    except ValueError as exc:
+        assert "No sampled rows passed the GPS filter" in str(exc)
+        assert " R24 " in str(exc)
+    else:
+        raise AssertionError("preflight should fail")
+
+
+def test_zero_valid_cache_is_not_reused(tmp_path: Path) -> None:
+    import duckdb
+    from tid_analyzer.importer.cache import cache_is_valid
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "LAMA_2024_246.txt").write_text("0;G01;1;120;80;21;51\n", encoding="utf-8")
+    manifest = build_manifest(folder, tmp_path / "cache")
+    db = Path(str(manifest["cache_path"]))
+    with duckdb.connect(str(db)) as con:
+        con.execute("UPDATE metadata SET completed=true, total_rows_seen=1, valid_rows_stored=0")
+    assert not cache_is_valid(db, folder, iter_station_files(folder), 2024, 246, ImportFilters())
+
+
+def test_station_code_extraction_and_catalog_matching(tmp_path: Path) -> None:
+    from tid_analyzer.stations.catalog import resolve_stations, station_code_from_filename
+    cache_dir = tmp_path / "cache" / "station_catalog"; cache_dir.mkdir(parents=True)
+    cache_dir.joinpath("sample.SSC").write_text("LAMA00POL 3664940.500 1409153.600 5009571.100\n", encoding="utf-8")
+    assert station_code_from_filename(Path("lama_2024_246.txt")) == "LAMA"
+    rows = resolve_stations(["LAMA", "ODDNAME"], tmp_path / "cache", allow_download=False)
+    lama = next(r for r in rows if r.station == "LAMA")
+    odd = next(r for r in rows if r.station == "ODDNAME")
+    assert lama.resolved and lama.full_site_id == "LAMA00POL"
+    assert not odd.resolved
