@@ -118,3 +118,7 @@ summary { cursor: pointer; color: #2f435b; font-weight: 700; }
 tbody tr.ineligibleArc { background: #fdecec; }
 tbody tr.ineligibleArc:hover { background: #fbd6d6; }
 .ineligibleStatus { color: #8b1a1a; font-weight: 800; }
+
+.interpSummary { display:grid; grid-template-columns: 1fr 1fr; gap: 2px 8px; margin-top: 8px; font-size: 12px; }
+.interpSummary p { margin: 2px 0; }
+.dtecRaster { pointer-events: none; image-rendering: auto; }
