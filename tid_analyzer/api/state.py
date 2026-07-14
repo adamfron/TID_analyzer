@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,6 +39,8 @@ class ImportState:
     queue: asyncio.Queue[dict[str, Any]] = field(default_factory=asyncio.Queue)
     task: asyncio.Task[None] | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    started_at_utc: datetime | None = None
+    started_monotonic: float | None = None
 
     async def publish(self, update: dict[str, Any]) -> None:
         self.status = update
@@ -48,12 +52,19 @@ class ImportState:
         overall_percent = round(((idx - 1) / 7 + (stage_percent / 100) / 7) * 100, 1) if idx else stage_percent
         if stage == "done":
             stage_percent = overall_percent = 100
-        return {"stage": stage, "stage_index": idx, "stage_count": 7, "stage_name": name, "current": current, "total": total, "percent": overall_percent, "stage_percent": stage_percent, "overall_percent": overall_percent, "message": message}
+        elapsed = (time.monotonic() - self.started_monotonic) if self.started_monotonic is not None else None
+        completed = current
+        mean = (elapsed / completed) if elapsed is not None and completed else None
+        remaining = (mean * max(0, total - completed)) if mean is not None and completed >= 5 else None
+        finish = (datetime.now(timezone.utc) + timedelta(seconds=remaining)).isoformat() if remaining is not None else None
+        return {"stage": stage, "stage_index": idx, "stage_count": 7, "stage_name": name, "current": current, "total": total, "percent": overall_percent, "stage_percent": stage_percent, "overall_percent": overall_percent, "message": message, "started_at_utc": self.started_at_utc.isoformat() if self.started_at_utc else None, "elapsed_seconds": elapsed, "completed_element_count": completed, "mean_seconds_per_element": mean, "remaining_seconds": remaining, "estimated_finish_utc": finish}
 
     async def start_import(self, folder: Path, filters: ImportFilters | None = None, force_rebuild: bool = False) -> None:
         if self.task and not self.task.done():
             raise RuntimeError("An import is already running")
         self.cancel_event.clear()
+        self.started_at_utc = datetime.now(timezone.utc)
+        self.started_monotonic = time.monotonic()
         self.task = asyncio.create_task(self._run_import(folder, filters or ImportFilters(), force_rebuild))
 
     async def cancel_import(self) -> None:
