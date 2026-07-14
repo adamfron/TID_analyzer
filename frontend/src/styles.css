@@ -243,3 +243,11 @@ tbody tr.selectedArc.ineligibleArc { background: #fee2e2; }
   .side { position: absolute; top: 0; right: 0; bottom: 0; width: min(420px, calc(100vw - 52px)); box-shadow: -16px 0 36px rgba(25,42,64,.18); }
   .workspace.sidebarCollapsed .side { width: 0; }
 }
+.solarSubLayers { margin-left: 16px; padding-left: 8px; border-left: 2px solid #c8d5e3; }
+.twilightShading rect { pointer-events: none; shape-rendering: crispEdges; }
+.solarContours path { fill: none; stroke-width: 1.8; pointer-events: none; vector-effect: non-scaling-stroke; }
+.solarContours .solarHorizon { stroke: #f59e0b; }
+.solarContours .solarCivil { stroke: #60a5fa; stroke-dasharray: 5 3; }
+.solarContours .solarNautical { stroke: #2563eb; stroke-dasharray: 4 4; }
+.solarContours .solarAstronomical { stroke: #1e3a8a; stroke-dasharray: 2 3; }
+.solarContours .solarIono { stroke: #7c3aed; stroke-dasharray: 7 3; }

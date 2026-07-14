@@ -23,6 +23,7 @@ from tid_analyzer.interpolation.storage import read_epoch_result, validate_inter
 from tid_analyzer.interpolation.natural_neighbor import METHOD, PROJECTION, DEFAULT_GRID_STEP_DEG
 from tid_analyzer.importer.cache import connect_cache
 from tid_analyzer.importer.parser import StationRow, build_manifest, iter_station_files, iter_valid_rows
+from tid_analyzer.solar import solar_geometry_from_manifest
 
 app = FastAPI(title="TID Analyzer API")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -134,6 +135,29 @@ async def get_manifest() -> dict[str, object]:
         raise HTTPException(status_code=404, detail="No manifest is available yet. Start an import first.")
     return state.manifest
 
+
+
+
+@app.get("/api/solar-geometry")
+async def solar_geometry(actual_time_h: float) -> dict[str, object]:
+    if state.manifest is None:
+        raise HTTPException(status_code=404, detail="No manifest is available yet. Start an import first.")
+    try:
+        year = int(state.manifest["year"])
+        doy = int(state.manifest["doy"])
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail="Imported manifest does not include year/day-of-year metadata.") from exc
+    grid = solar_geometry_from_manifest(year, doy, actual_time_h)
+    return {
+        "utc_datetime": grid.utc_datetime,
+        "subsolar_latitude": grid.subsolar_latitude,
+        "subsolar_longitude": grid.subsolar_longitude,
+        "lon_values": list(grid.lon_values),
+        "lat_values": list(grid.lat_values),
+        "solar_elevation_deg": [list(row) for row in grid.solar_elevation_deg],
+        "contour_thresholds_deg": list(grid.contour_thresholds_deg),
+        "ionospheric_shadow": grid.ionospheric_shadow,
+    }
 
 @app.get("/api/stations/catalog")
 async def station_catalog() -> dict[str, object]:
