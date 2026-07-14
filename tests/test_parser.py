@@ -486,3 +486,78 @@ def test_frontend_station_ipp_rays_and_plot_labels() -> None:
     assert "values outside displayed range [-1, 1] TECU" in text
     assert "Period [min]" in text and "Amplitude [TECU]" in text
     assert "Time [h UT]" in text and "Power" in text
+
+
+def _arc_rows(station_sets: list[list[str]], start_h: float = 0.0, step_min: float = 30.0):
+    return [
+        ("G99", i, start_h + i * step_min / 60.0, len(stations), len(set(stations)), tuple(sorted(set(stations))))
+        for i, stations in enumerate(station_sets)
+    ]
+
+
+def test_visibility_arc_interpolation_eligibility_threshold_examples() -> None:
+    from tid_analyzer.api.app import _visibility_arc_from_epochs
+
+    ninety_nine = [f"S{i:03d}" for i in range(99)]
+    hundred = [f"S{i:03d}" for i in range(100)]
+
+    arc = _visibility_arc_from_epochs("G99", 1, _arc_rows([ninety_nine] * 14, step_min=10.0))
+    assert arc["duration_min"] == 130
+    assert arc["eligible_for_interpolation"] is False
+    assert arc["ineligibility_reasons"] == ["fewer than 100 stations"]
+
+    arc = _visibility_arc_from_epochs("G99", 1, _arc_rows([hundred] * 240, step_min=119.5 / 239))
+    assert arc["duration_min"] == 119.5
+    assert arc["eligible_for_interpolation"] is False
+    assert arc["ineligibility_reasons"] == ["duration shorter than 120 minutes"]
+
+    arc = _visibility_arc_from_epochs("G99", 1, _arc_rows([hundred] * 13, step_min=10.0))
+    assert arc["duration_min"] == 120
+    assert arc["eligible_for_interpolation"] is True
+    assert arc["ineligibility_reasons"] == []
+
+    arc = _visibility_arc_from_epochs("G99", 1, _arc_rows([ninety_nine] * 10, step_min=10.0))
+    assert arc["eligible_for_interpolation"] is False
+    assert arc["ineligibility_reasons"] == ["fewer than 100 stations", "duration shorter than 120 minutes"]
+
+
+def test_visibility_arc_station_epoch_and_interpolation_metadata_are_deterministic() -> None:
+    from tid_analyzer.api.app import _visibility_arc_from_epochs
+
+    rows = _arc_rows([
+        ["A", "A", "B"],
+        ["B", "C", "D", "E"],
+        ["A", "E"],
+    ])
+    arc = _visibility_arc_from_epochs("G99", 1, rows)
+    assert arc["station_count"] == 5
+    assert arc["epoch_count"] == 3
+    assert arc["max_station_count"] == 4
+    assert arc["median_station_count"] == 2.0
+    assert arc["interpolation_status"] == "not_generated"
+    assert arc["generated_map_count"] == 0
+    assert arc["failed_map_count"] == 0
+
+
+def test_visibility_endpoint_station_count_uses_unique_codes(tmp_path: Path) -> None:
+    folder = tmp_path / "day"; folder.mkdir()
+    (folder / "DUPA_2024_246.txt").write_text("0.0;G24;1;1;80;10;50\n0.0;G24;2;1;80;10;50\n", encoding="utf-8")
+    (folder / "DUPB_2024_246.txt").write_text("0.0;G24;1;1;80;10;50\n", encoding="utf-8")
+    state.source_folder = folder
+    state.cache_path = None
+    state.manifest = None
+    data = TestClient(app).get("/api/satellites/visibility?gap_minutes=10").json()
+    arc = data["arcs"][0]
+    assert arc["row_count"] == 3
+    assert arc["station_count"] == 2
+    assert arc["epoch_count"] == 1
+    assert arc["median_station_count"] == 2.0
+
+
+def test_visibility_frontend_keeps_ineligible_rows_selectable_and_no_interpolation_jobs() -> None:
+    source = Path("frontend/src/main.tsx").read_text(encoding="utf-8")
+    assert "className={a.eligible_for_interpolation ? '' : 'ineligibleArc'}" in source
+    assert "onClick={()=>choose(a)}" in source
+    assert "Planned maps" in source
+    assert "interpolation/job" not in source.lower()
+    assert "interpolation/files" not in source.lower()

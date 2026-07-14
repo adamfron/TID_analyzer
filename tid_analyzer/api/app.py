@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from statistics import median
 
 import numpy as np
 from importlib import resources
@@ -192,12 +193,18 @@ async def satellite_visibility(gap_minutes: float = Query(10, gt=0)) -> dict[str
     gap_epochs = gap_minutes * 60 / 30
     arcs: list[dict[str, object]] = []
     with connect_cache(cache_path) as con:
-        rows = con.execute("SELECT prn, epoch_index, time_h, row_count, station_count FROM prn_epochs ORDER BY prn, epoch_index").fetchall()
-    current: list[tuple[str, int, float, int, int]] = []
+        rows = con.execute("""
+            SELECT prn, epoch_index, AVG(time_h) AS time_h, COUNT(*) AS row_count,
+                   COUNT(DISTINCT station) AS station_count, LIST(DISTINCT station ORDER BY station) AS stations
+            FROM observations
+            GROUP BY prn, epoch_index
+            ORDER BY prn, epoch_index
+        """).fetchall()
+    current: list[tuple[str, int, float, int, int, tuple[str, ...]]] = []
     arc_index = 1
     previous_prn: str | None = None
     previous_epoch: int | None = None
-    for prn, epoch_index, time_h, row_count, station_count in rows:
+    for prn, epoch_index, time_h, row_count, station_count, stations in rows:
         prn = str(prn); epoch_index = int(epoch_index)
         starts_new_prn = previous_prn is not None and prn != previous_prn
         gap_split = previous_epoch is not None and epoch_index - previous_epoch > gap_epochs
@@ -205,7 +212,7 @@ async def satellite_visibility(gap_minutes: float = Query(10, gt=0)) -> dict[str
             arcs.append(_visibility_arc_from_epochs(current[0][0], arc_index, current))
             arc_index = 1 if starts_new_prn else arc_index + 1
             current = []
-        current.append((prn, epoch_index, float(time_h), int(row_count), int(station_count)))
+        current.append((prn, epoch_index, float(time_h), int(row_count), int(station_count), tuple(str(s) for s in (stations or []))))
         previous_prn = prn
         previous_epoch = epoch_index
     if current:
@@ -233,10 +240,35 @@ def _catalog_station_markers(cache_path: Path, station_codes: list[str] | None) 
         "resolution_note": r[9], "approximate": False,
     } for r in rows]
 
-def _visibility_arc_from_epochs(prn: str, arc_index: int, rows: list[tuple[str, int, float, int, int]]) -> dict[str, object]:
+def _visibility_arc_from_epochs(prn: str, arc_index: int, rows: list[tuple[str, int, float, int, int, tuple[str, ...]]]) -> dict[str, object]:
     start = rows[0][2]
     end = rows[-1][2]
-    return {"prn": prn, "arc_index": arc_index, "start_time_h": start, "end_time_h": end, "duration_min": (end - start) * 60, "row_count": sum(r[3] for r in rows), "station_count": max(r[4] for r in rows), "epoch_count": len(rows)}
+    duration_min = (end - start) * 60
+    per_epoch_station_counts = [int(r[4]) for r in rows]
+    unique_stations = {station for row in rows for station in row[5]}
+    station_count = len(unique_stations)
+    reasons: list[str] = []
+    if station_count < 100:
+        reasons.append("fewer than 100 stations")
+    if duration_min < 120:
+        reasons.append("duration shorter than 120 minutes")
+    return {
+        "prn": prn,
+        "arc_index": arc_index,
+        "start_time_h": start,
+        "end_time_h": end,
+        "duration_min": duration_min,
+        "row_count": sum(r[3] for r in rows),
+        "station_count": station_count,
+        "epoch_count": len(rows),
+        "max_station_count": max(per_epoch_station_counts),
+        "median_station_count": float(median(per_epoch_station_counts)),
+        "eligible_for_interpolation": not reasons,
+        "ineligibility_reasons": reasons,
+        "interpolation_status": "not_generated",
+        "generated_map_count": 0,
+        "failed_map_count": 0,
+    }
 
 
 @app.get("/api/map/epoch")
