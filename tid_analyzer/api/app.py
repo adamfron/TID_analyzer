@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import asyncio
 from statistics import median
 
 import numpy as np
@@ -117,6 +118,11 @@ async def get_status() -> dict[str, object]:
     return state.status
 
 
+@app.get("/api/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok", "import_state": str(state.status.get("stage", "idle")), "interpolation_state": str(interpolation_state.status.get("state", "idle"))}
+
+
 @app.get("/api/manifest")
 async def get_manifest() -> dict[str, object]:
     if state.manifest is None:
@@ -138,13 +144,17 @@ async def station_catalog() -> dict[str, object]:
 
 @app.get("/api/assets/world-borders")
 async def world_borders() -> Response:
+    repo_asset = Path(__file__).resolve().parents[2] / "assets/world/TM_WORLD_BORDERS-0.3.geojson"
     try:
-        asset = resources.files("tid_analyzer").joinpath("assets/world/TM_WORLD_BORDERS-0.3.geojson")
-        text = asset.read_text(encoding="utf-8")
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Bundled world borders GeoJSON asset is missing: tid_analyzer/assets/world/TM_WORLD_BORDERS-0.3.geojson") from exc
-    except ModuleNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="World borders asset package is unavailable.") from exc
+        text = repo_asset.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        try:
+            asset = resources.files("tid_analyzer").joinpath("assets/world/TM_WORLD_BORDERS-0.3.geojson")
+            text = asset.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="World borders GeoJSON asset is missing from assets/world or tid_analyzer/assets/world.") from exc
+        except ModuleNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="World borders asset package is unavailable.") from exc
     return Response(content=text, media_type="application/geo+json")
 
 
@@ -495,14 +505,35 @@ async def select_folder() -> dict[str, str | None]:
     return {"folder_path": folder or None}
 
 
+import_subscribers: set[WebSocket] = set()
+
+
+async def _import_broadcaster() -> None:
+    while True:
+        update = await state.queue.get()
+        stale: list[WebSocket] = []
+        for websocket in list(import_subscribers):
+            try:
+                await websocket.send_json({**update, "operation": "import"})
+            except Exception:
+                stale.append(websocket)
+        for websocket in stale:
+            import_subscribers.discard(websocket)
+
+
+@app.on_event("startup")
+async def start_import_broadcaster() -> None:
+    asyncio.create_task(_import_broadcaster())
+
+
 @app.websocket("/ws/import-progress")
 async def import_progress(websocket: WebSocket) -> None:
-    await websocket.accept(); await websocket.send_json({**state.status, "operation": "import"})
+    await websocket.accept(); import_subscribers.add(websocket); await websocket.send_json({**state.status, "operation": "import"})
     try:
         while True:
-            update = await state.queue.get(); await websocket.send_json({**update, "operation": "import"})
+            await websocket.receive_text()
     except WebSocketDisconnect:
-        return
+        import_subscribers.discard(websocket)
 
 
 @app.websocket("/ws/interpolation-progress")

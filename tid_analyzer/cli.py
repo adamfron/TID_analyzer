@@ -8,6 +8,8 @@ import sys
 import threading
 import time
 import webbrowser
+from urllib.request import urlopen
+from urllib.error import URLError
 from pathlib import Path
 
 import uvicorn
@@ -34,6 +36,26 @@ def resolve_npm() -> str | None:
     return None
 
 
+def _url_responds(url: str, timeout: float = 0.5) -> bool:
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            return 200 <= response.status < 500
+    except (OSError, URLError):
+        return False
+
+
+def wait_for_servers_and_open(host: str, port: int, frontend_url: str, timeout_seconds: float = 30.0) -> bool:
+    backend_url = f"http://{host}:{port}/api/health"
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _url_responds(backend_url) and _url_responds(frontend_url):
+            webbrowser.open(frontend_url)
+            return True
+        time.sleep(0.25)
+    print(f"Warning: browser was not opened because backend {backend_url} and frontend {frontend_url} were not both ready within {timeout_seconds:.0f}s.", file=sys.stderr)
+    return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Start the local TID Analyzer backend and open the browser.")
     parser.add_argument("--host", default="127.0.0.1")
@@ -56,7 +78,7 @@ def main() -> None:
         frontend_proc = subprocess.Popen([npm, "run", "dev"], cwd=front)
 
     if not args.no_browser:
-        threading.Thread(target=lambda: (time.sleep(1.0), webbrowser.open(args.frontend_url)), daemon=True).start()
+        threading.Thread(target=lambda: wait_for_servers_and_open(args.host, args.port, args.frontend_url), daemon=True).start()
 
     try:
         uvicorn.run("tid_analyzer.api.app:app", host=args.host, port=args.port, reload=False)
