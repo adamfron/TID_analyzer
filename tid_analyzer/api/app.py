@@ -17,17 +17,26 @@ except ImportError:  # pragma: no cover - dependency is declared for runtime ins
 
 from tid_analyzer.config import ImportFilters
 from tid_analyzer.api.state import ImportState
+from tid_analyzer.interpolation.orchestrator import InterpolationController, eligible_arcs_from_daily, get_epoch_status
+from tid_analyzer.interpolation.storage import read_epoch_result, validate_interpolation_cache
+from tid_analyzer.interpolation.natural_neighbor import METHOD, PROJECTION, DEFAULT_GRID_STEP_DEG
 from tid_analyzer.importer.cache import connect_cache
 from tid_analyzer.importer.parser import StationRow, build_manifest, iter_station_files, iter_valid_rows
 
 app = FastAPI(title="TID Analyzer API")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 state = ImportState()
+interpolation_state = InterpolationController(cache_dir=state.cache_dir)
 
 
 class ImportRequest(BaseModel):
     folder_path: str
     min_elevation_deg: float = 50.0
+
+
+class InterpolationBuildRequest(BaseModel):
+    retry_failed: bool = False
+    force_rebuild: bool = False
 
 
 class SpectralRequest(BaseModel):
@@ -217,7 +226,7 @@ async def satellite_visibility(gap_minutes: float = Query(10, gt=0)) -> dict[str
         previous_epoch = epoch_index
     if current:
         arcs.append(_visibility_arc_from_epochs(current[0][0], arc_index, current))
-    return {"arcs": arcs}
+    return {"arcs": _attach_interpolation_arc_status(cache_path, arcs)}
 
 
 def _catalog_station_markers(cache_path: Path, station_codes: list[str] | None) -> list[dict[str, object]]:
@@ -239,6 +248,28 @@ def _catalog_station_markers(cache_path: Path, station_codes: list[str] | None) 
         "lon": r[5], "lat": r[6], "height": r[7], "source": r[8], "resolved": True,
         "resolution_note": r[9], "approximate": False,
     } for r in rows]
+
+def _attach_interpolation_arc_status(cache_path: Path, arcs: list[dict[str, object]]) -> list[dict[str, object]]:
+    try:
+        from tid_analyzer.interpolation.orchestrator import _cache_dir_for_daily
+        cache_dir = _cache_dir_for_daily(state.cache_dir, cache_path)
+        metadata = validate_interpolation_cache(cache_dir).metadata or {}
+        entries = {(e["prn"], int(e["arc_index"])): e for e in metadata.get("arc_entries", [])}
+    except Exception:
+        entries = {}
+    out = []
+    for arc in arcs:
+        copied = dict(arc)
+        if not copied.get("eligible_for_interpolation"):
+            copied.update({"interpolation_status": "ineligible", "generated_map_count": 0, "failed_map_count": 0})
+        else:
+            entry = entries.get((str(copied["prn"]), int(copied["arc_index"])))
+            ready = int((entry or {}).get("stored_epoch_count", 0)); failed = int((entry or {}).get("failed_epoch_count", 0)); expected = int(copied.get("epoch_count", 0))
+            status = "not_generated" if not entry or (ready == 0 and failed == 0) else ("ready" if ready >= expected and failed == 0 else ("failed" if ready == 0 and failed > 0 else "partial"))
+            copied.update({"interpolation_status": status, "generated_map_count": ready, "failed_map_count": failed})
+        out.append(copied)
+    return out
+
 
 def _visibility_arc_from_epochs(prn: str, arc_index: int, rows: list[tuple[str, int, float, int, int, tuple[str, ...]]]) -> dict[str, object]:
     start = rows[0][2]
@@ -381,6 +412,75 @@ async def spectral_morlet(request: SpectralRequest) -> dict[str, object]:
     return {"station": request.station.upper(), "prn": request.prn, "time_h": t.tolist(), "period_min": periods.tolist(), "power": (np.abs(coeffs) ** 2).tolist()}
 
 
+
+@app.post("/api/interpolation/build-all")
+async def interpolation_build_all(request: InterpolationBuildRequest) -> dict[str, object]:
+    cache_path = _require_cache_path()
+    try:
+        response = await interpolation_state.start_build(daily_cache_path=cache_path, retry_failed=request.retry_failed, force_rebuild=request.force_rebuild)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"message": "Interpolation build started", **response}
+
+
+@app.post("/api/interpolation/cancel")
+async def interpolation_cancel() -> dict[str, str]:
+    await interpolation_state.cancel()
+    return {"message": "Interpolation cancellation requested"}
+
+
+@app.get("/api/interpolation/status")
+async def interpolation_status() -> dict[str, object]:
+    return interpolation_state.status
+
+
+@app.get("/api/interpolation/summary")
+async def interpolation_summary() -> dict[str, object]:
+    cache_path = _require_cache_path()
+    arcs = eligible_arcs_from_daily(cache_path)
+    eligible = [a for a in arcs if a.get("eligible_for_interpolation")]
+    try:
+        from tid_analyzer.interpolation.orchestrator import _cache_dir_for_daily
+        cache_dir = _cache_dir_for_daily(state.cache_dir, cache_path)
+        validation = validate_interpolation_cache(cache_dir)
+        metadata = validation.metadata or {}
+    except Exception:
+        validation = None; metadata = {}
+    entries = {(e["prn"], int(e["arc_index"])): e for e in metadata.get("arc_entries", [])}
+    per_arc=[]; ready=failed=0
+    for arc in eligible:
+        e = entries.get((str(arc["prn"]), int(arc["arc_index"])), {})
+        r=int(e.get("stored_epoch_count",0)); f=int(e.get("failed_epoch_count",0)); exp=int(arc["epoch_count"]); ready+=r; failed+=f
+        st = "not_generated" if r==0 and f==0 else ("ready" if r>=exp and f==0 else ("failed" if r==0 and f>0 else "partial"))
+        per_arc.append({"prn": arc["prn"], "arc_index": arc["arc_index"], "expected": exp, "ready": r, "failed": f, "status": st})
+    planned=sum(int(a["epoch_count"]) for a in eligible)
+    return {"eligible_arc_count": len(eligible), "ineligible_arc_count": len(arcs)-len(eligible), "planned_map_count": planned, "ready_map_count": ready, "missing_map_count": max(0, planned-ready-failed), "failed_map_count": failed, "cache_compatible": bool(validation and validation.compatible), "cache_completed": bool(metadata.get("completed", False)), "method": metadata.get("interpolation_method", METHOD), "projection": metadata.get("projection", PROJECTION), "grid_step_deg": float(metadata.get("grid_step_deg", DEFAULT_GRID_STEP_DEG)), "arcs": per_arc}
+
+
+@app.get("/api/interpolation/epoch")
+async def interpolation_epoch(prn: str = Query(...), time_h: float = Query(...)) -> dict[str, object]:
+    cache_path = _require_cache_path()
+    with connect_cache(cache_path) as con:
+        row = con.execute("SELECT epoch_index, time_h FROM prn_epochs WHERE prn = ? ORDER BY ABS(epoch_index - ROUND(? * 120)), time_h LIMIT 1", [prn, time_h]).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No cached epochs are available for PRN {prn}.")
+    epoch_index, actual_time_h = int(row[0]), float(row[1])
+    arcs = [a for a in eligible_arcs_from_daily(cache_path) if str(a["prn"]) == prn and int(round(float(a["start_time_h"])*120)) <= epoch_index <= int(round(float(a["end_time_h"])*120))]
+    if not arcs:
+        raise HTTPException(status_code=404, detail=f"No interpolation arc contains PRN {prn} epoch {epoch_index}.")
+    arc = arcs[0]
+    from tid_analyzer.interpolation.orchestrator import _cache_dir_for_daily
+    cache_dir = _cache_dir_for_daily(state.cache_dir, cache_path)
+    status = get_epoch_status(cache_dir, prn=prn, arc_index=int(arc["arc_index"]), epoch_index=epoch_index)
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"No interpolation grid is cached for PRN {prn} epoch {epoch_index}.")
+    payload = read_epoch_result(cache_dir, prn=prn, arc_index=int(arc["arc_index"]), epoch_index=epoch_index)
+    base = {"prn": prn, "requested_time_h": time_h, "actual_time_h": actual_time_h, "epoch_index": epoch_index, "available": status == "ready", "method": payload["method"], "projection": payload["projection"], "grid_step_deg": payload["grid_step_deg"], "point_count": payload["point_count"], "station_count": payload["station_count"], "status": status}
+    if status != "ready":
+        return {**base, "message": payload.get("message", "")}
+    return {**base, "lon_values": payload["lon_values"].tolist(), "lat_values": payload["lat_values"].tolist(), "values": payload["values"].tolist(), "valid_mask": payload["valid_mask"].tolist()}
+
+
 @app.post("/api/select-folder")
 async def select_folder() -> dict[str, str | None]:
     try:
@@ -397,9 +497,19 @@ async def select_folder() -> dict[str, str | None]:
 
 @app.websocket("/ws/import-progress")
 async def import_progress(websocket: WebSocket) -> None:
-    await websocket.accept(); await websocket.send_json(state.status)
+    await websocket.accept(); await websocket.send_json({**state.status, "operation": "import"})
     try:
         while True:
-            update = await state.queue.get(); await websocket.send_json(update)
+            update = await state.queue.get(); await websocket.send_json({**update, "operation": "import"})
+    except WebSocketDisconnect:
+        return
+
+
+@app.websocket("/ws/interpolation-progress")
+async def interpolation_progress(websocket: WebSocket) -> None:
+    await websocket.accept(); await websocket.send_json(interpolation_state.status)
+    try:
+        while True:
+            update = await interpolation_state.queue.get(); await websocket.send_json(update)
     except WebSocketDisconnect:
         return
