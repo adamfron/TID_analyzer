@@ -11,8 +11,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from metpy.interpolate import natural_neighbor_to_grid
-from pyproj import Transformer
+try:
+    from metpy.interpolate import natural_neighbor_to_grid
+except ImportError:  # pragma: no cover - optional in minimal test environments
+    natural_neighbor_to_grid = None
+try:
+    from pyproj import Transformer
+except ImportError:  # pragma: no cover
+    Transformer = None
 
 METHOD = "metpy_natural_neighbor_liang_hale"
 PROJECTION = "EPSG:3035"
@@ -86,6 +92,24 @@ def interpolate_prn_epoch_natural_neighbor(
     values = values[keep]
 
     station_count = len({str(station) for station in stations})
+
+    if natural_neighbor_to_grid is None or Transformer is None:
+        return NaturalNeighborResult(
+            prn=prn,
+            epoch_index=epoch_index,
+            time_h=time_h,
+            method=METHOD,
+            projection=PROJECTION,
+            grid_step_deg=grid_step_deg,
+            lon_values=lon_values,
+            lat_values=lat_values,
+            values=empty_values,
+            valid_mask=empty_mask,
+            point_count=0,
+            station_count=station_count,
+            status="failed",
+            message="MetPy and pyproj are required for natural-neighbour interpolation.",
+        )
 
     transformer = Transformer.from_crs(SOURCE_CRS, PROJECTION, always_xy=True)
     target_x, target_y = transformer.transform(grid_lon, grid_lat)
