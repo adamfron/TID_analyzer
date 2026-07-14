@@ -561,3 +561,78 @@ def test_visibility_frontend_keeps_ineligible_rows_selectable_and_no_interpolati
     assert "Planned maps" in source
     assert "interpolation/job" not in source.lower()
     assert "interpolation/files" not in source.lower()
+
+
+def test_health_endpoint_works_without_imported_data() -> None:
+    old_manifest, old_source, old_cache = state.manifest, state.source_folder, state.cache_path
+    state.manifest = None; state.source_folder = None; state.cache_path = None
+    try:
+        response = TestClient(app).get("/api/health")
+    finally:
+        state.manifest, state.source_folder, state.cache_path = old_manifest, old_source, old_cache
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert "import_state" in data and "interpolation_state" in data
+
+
+def test_preparing_database_maps_to_stage_three() -> None:
+    from tid_analyzer.api.state import ImportState
+    update = ImportState()._format_update("preparing_database", 0, 1, "[3/7] Preparing daily database")
+    assert update["stage_index"] == 3
+    assert update["stage_count"] == 7
+    assert update["stage_name"] == "Preparing daily database"
+
+
+def test_launcher_waits_for_backend_and_frontend(monkeypatch) -> None:
+    from tid_analyzer import cli
+    calls: list[str] = []
+    opened: list[str] = []
+    def fake_responds(url: str, timeout: float = 0.5) -> bool:
+        calls.append(url)
+        return len(calls) >= 3
+    monkeypatch.setattr(cli, "_url_responds", fake_responds)
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url) or True)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    assert cli.wait_for_servers_and_open("127.0.0.1", 8000, "http://localhost:5173", timeout_seconds=1)
+    assert "http://127.0.0.1:8000/api/health" in calls
+    assert "http://localhost:5173" in calls
+    assert opened == ["http://localhost:5173"]
+
+
+def test_frontend_startup_reliability_patterns_present() -> None:
+    source = Path("frontend/src/main.tsx").read_text(encoding="utf-8")
+    assert "fetchWithRetry(`${API}/api/health`" in source
+    assert "fetchWithRetry(`${API}/api/assets/world-borders`" in source
+    assert "Retry world borders" in source
+    assert "setWorld(null); setWorldStatus('Ready'); setWorldError" in source
+    assert "setWorld(await r.json()); setWorldStatus('Ready')" in source
+
+
+def test_frontend_import_polling_updates_and_stops() -> None:
+    source = Path("frontend/src/main.tsx").read_text(encoding="utf-8")
+    assert "startImportPolling()" in source
+    assert "fetch(`${API}/api/import/status`)" in source
+    assert "applyImportStatus(update)" in source
+    assert "window.setInterval" in source and "}, 500)" in source
+    assert "['done','error','cancelled'].includes(update.stage)" in source
+    assert "window.clearInterval(poll)" in source
+    assert "update.stage === 'stations_resolved'" in source and "fetchStationCatalog()" in source
+
+
+def test_frontend_interpolation_summary_not_requested_before_manifest() -> None:
+    source = Path("frontend/src/main.tsx").read_text(encoding="utf-8")
+    assert "if (!manifest)" in source
+    assert "setInterpolationSummary({eligible_arc_count:0" in source
+    assert "fetch(`${API}/api/interpolation/summary`)" in source
+
+
+def test_import_progress_websocket_broadcasts_to_subscribers() -> None:
+    source = Path("tid_analyzer/api/app.py").read_text(encoding="utf-8")
+    assert "import_subscribers: set[WebSocket]" in source
+    assert "for websocket in list(import_subscribers)" in source
+    assert "import_subscribers.add(websocket)" in source
+    assert "import_subscribers.discard(websocket)" in source
+    frontend = Path("frontend/src/main.tsx").read_text(encoding="utf-8")
+    assert "ws.onerror = retry; ws.onclose = retry" in frontend
+    assert "if (closed || ws) return" in frontend

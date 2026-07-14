@@ -14,6 +14,7 @@ STAGES = {
     "scanning_files": (1, "Scanning files"),
     "resolving_stations": (2, "Resolving station coordinates"),
     "stations_resolved": (2, "Resolving station coordinates"),
+    "preparing_database": (3, "Preparing daily database"),
     "validating_input": (3, "Validating input format and filters"),
     "reading_filtering": (4, "Reading and filtering source files"),
     "writing_database": (4, "Reading and filtering source files"),
