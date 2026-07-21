@@ -12,7 +12,7 @@ assert.match(src, /function panViewport[\s\S]*lon_min:v\.lon_min\+dLon[\s\S]*lat
 assert.match(src, /onDoubleClick=\{\(\)=>setViewport\?\.\(EUROPE_VIEWPORT\)\}/, 'double click resets Europe extent');
 for (const label of ['Zoom in','Zoom out','Reset view']) assert.ok(src.includes(`>${label}</button>`), `${label} button exists`);
 assert.match(src, /className="stationHitTarget" onClick=\{\(\)=>onStationClick\(m\.station, prn\)\}/, 'station selection uses station marker coordinates and expanded hit target');
-assert.match(src, /<circle cx=\{sx\} cy=\{sy\} r="7" className="stationHitTarget"/, 'station hit target is about 14 px diameter');
+assert.match(src, /<circle cx=\{sx\} cy=\{sy\} r=\{Math\.max\(8, display\.stationMarkerSize\)\} className="stationHitTarget"/, 'station hit target is about 14 px diameter');
 assert.match(css, /stationMarker text[\s\S]*pointer-events:\s*none/, 'station labels do not intercept clicks');
 assert.match(src, /layers\.grid && <g className="grid internalGrid">/, 'grid toggle only controls internal grid lines');
 assert.match(src, /<g className="ticks">/, 'coordinate ticks and labels are always rendered');
