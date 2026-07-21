@@ -29,6 +29,6 @@ assert.match(src, /layers\.solar && solarGeometry && <SolarContours/, 'master so
 assert.match(src, /className="geographicLayers" clipPath=\{`url\(#\$\{clipId\}\)`\}/, 'twilight fields and contours share the clipped geographic layer');
 assert.match(src, /viewport\.lon_min.*viewport\.lon_max.*viewport\.lat_min.*viewport\.lat_max/, 'twilight raster generation uses viewport bounds for zoom/pan alignment');
 assert.match(src, /canvas\.toDataURL\('image\/png'\)/, 'twilight canvas is embedded as PNG data for SVG export');
-assert.match(src, /exportActiveMap\(p\.prn, p\.actualTimeH \|\| p\.timeH, p\.onExportError\)/, 'map PNG export includes the active SVG layers');
+assert.match(src, /exportActiveMap\(\{prn:p\.prn, timeH:p\.actualTimeH \|\| p\.timeH/, 'map PNG export receives active map state layers');
 
 console.log('solar twilight rendering source checks passed');
