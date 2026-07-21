@@ -244,7 +244,7 @@ tbody tr.selectedArc.ineligibleArc { background: #fee2e2; }
   .workspace.sidebarCollapsed .side { width: 0; }
 }
 .solarSubLayers { margin-left: 16px; padding-left: 8px; border-left: 2px solid #c8d5e3; }
-.twilightShading rect { pointer-events: none; shape-rendering: crispEdges; }
+.twilightShading .twilightImage { pointer-events: none; image-rendering: auto; }
 .solarContours path { fill: none; stroke-width: 1.8; pointer-events: none; vector-effect: non-scaling-stroke; }
 .solarContours .solarHorizon { stroke: #f59e0b; }
 .solarContours .solarCivil { stroke: #60a5fa; stroke-dasharray: 5 3; }
