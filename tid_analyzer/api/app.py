@@ -18,8 +18,8 @@ except ImportError:  # pragma: no cover - dependency is declared for runtime ins
 
 from tid_analyzer.config import DEFAULT_MINIMUM_EPOCH_IPP_COUNT, ImportFilters
 from tid_analyzer.api.state import ImportState
-from tid_analyzer.interpolation.orchestrator import InterpolationController, eligible_arcs_from_daily, get_epoch_status
-from tid_analyzer.interpolation.storage import read_epoch_result, validate_interpolation_cache
+from tid_analyzer.interpolation.orchestrator import InterpolationController, eligible_arcs_from_daily, get_epoch_status, build_combined_gps_plan
+from tid_analyzer.interpolation.storage import read_epoch_result, validate_interpolation_cache, read_combined_epoch_result, get_combined_epoch_status, PRODUCT_TYPE_PER_PRN, PRODUCT_TYPE_COMBINED_GPS, COMBINED_GPS_PRODUCT_ID, COMBINED_GPS_WARNING
 from tid_analyzer.interpolation.natural_neighbor import METHOD, PROJECTION, DEFAULT_GRID_STEP_DEG, prepare_grid_geometry, validate_grid_step
 from tid_analyzer.importer.cache import connect_cache
 from tid_analyzer.importer.parser import StationRow, build_manifest, iter_station_files, iter_valid_rows
@@ -53,6 +53,14 @@ class InterpolationBuildRequest(BaseModel):
 class InterpolationBuildArcRequest(InterpolationBuildRequest):
     prn: str
     arc_index: int
+
+
+class CombinedInterpolationBuildRequest(InterpolationBuildRequest):
+    start_time_h: float | None = None
+    end_time_h: float | None = None
+    entire_day: bool = False
+    current_epoch_only: bool = False
+    current_time_h: float | None = None
 
 
 class AnalysisSetRequest(BaseModel):
@@ -385,13 +393,20 @@ def _visibility_arc_from_epochs(prn: str, arc_index: int, rows: list[tuple[str, 
 async def map_epoch(prn: str = Query(...), time_h: float = Query(...)) -> dict[str, object]:
     cache_path = _require_cache_path()
     with connect_cache(cache_path) as con:
-        epoch = con.execute("SELECT epoch_index, time_h FROM prn_epochs WHERE prn = ? ORDER BY ABS(time_h - ?), time_h LIMIT 1", [prn, time_h]).fetchone()
+        if prn == COMBINED_GPS_PRODUCT_ID:
+            epoch = con.execute("SELECT epoch_index, AVG(time_h) FROM observations WHERE prn LIKE 'G%' GROUP BY epoch_index ORDER BY ABS(epoch_index - ROUND(? * 120)) LIMIT 1", [time_h]).fetchone()
+        else:
+            epoch = con.execute("SELECT epoch_index, time_h FROM prn_epochs WHERE prn = ? ORDER BY ABS(time_h - ?), time_h LIMIT 1", [prn, time_h]).fetchone()
         if epoch is None:
-            raise HTTPException(status_code=404, detail=f"No epochs are available for PRN {prn}.")
+            raise HTTPException(status_code=404, detail=f"No epochs are available for product {prn}.")
         epoch_index, actual_time_h = int(epoch[0]), float(epoch[1])
-        rows = con.execute("SELECT station, prn, time_h, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat FROM observations WHERE prn = ? AND epoch_index = ? ORDER BY station", [prn, epoch_index]).fetchall()
+        if prn == COMBINED_GPS_PRODUCT_ID:
+            rows = con.execute("SELECT station, prn, time_h, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat FROM observations WHERE prn LIKE 'G%' AND epoch_index = ? AND isfinite(ipp_lon) AND isfinite(ipp_lat) AND isfinite(dtec) ORDER BY prn, station", [epoch_index]).fetchall()
+        else:
+            rows = con.execute("SELECT station, prn, time_h, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat FROM observations WHERE prn = ? AND epoch_index = ? ORDER BY station", [prn, epoch_index]).fetchall()
     points = [_row_from_tuple(t).__dict__ for t in rows]
-    return {"prn": prn, "requested_time_h": time_h, "actual_time_h": actual_time_h, "epoch_index": epoch_index, "points": points, "count": len(points), "stations": sorted({str(p["station"]) for p in points}), "station_markers": _catalog_station_markers(cache_path, sorted({str(p["station"]) for p in points}))}
+    product_type = PRODUCT_TYPE_COMBINED_GPS if prn == COMBINED_GPS_PRODUCT_ID else PRODUCT_TYPE_PER_PRN
+    return {"product_type": product_type, "product_id": prn, "prn": prn, "prn_count": len({str(p["prn"]) for p in points}), "warning": COMBINED_GPS_WARNING if product_type == PRODUCT_TYPE_COMBINED_GPS else None, "requested_time_h": time_h, "actual_time_h": actual_time_h, "epoch_index": epoch_index, "points": points, "count": len(points), "stations": sorted({str(p["station"]) for p in points}), "station_markers": _catalog_station_markers(cache_path, sorted({str(p["station"]) for p in points}))}
 
 
 def _station_query_values(station: list[str]) -> list[str]:
@@ -512,6 +527,25 @@ async def interpolation_build_arc(request: InterpolationBuildArcRequest) -> dict
     return {"message": "Arc interpolation build started", **response}
 
 
+
+@app.post("/api/interpolation/build-combined-gps")
+async def interpolation_build_combined(request: CombinedInterpolationBuildRequest) -> dict[str, object]:
+    cache_path = _require_cache_path()
+    if request.start_time_h is not None and request.end_time_h is not None and request.start_time_h > request.end_time_h:
+        raise HTTPException(status_code=400, detail="start_time_h must be <= end_time_h.")
+    try:
+        response = await interpolation_state.start_build(daily_cache_path=cache_path, retry_failed=request.retry_failed, force_rebuild=request.force_rebuild, minimum_epoch_ipp_count=request.minimum_epoch_ipp_count, grid_step_deg=request.grid_step_deg, product_type=PRODUCT_TYPE_COMBINED_GPS, start_time_h=None if request.entire_day else request.start_time_h, end_time_h=None if request.entire_day else request.end_time_h, current_epoch_time_h=request.current_time_h if request.current_epoch_only else None)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"message": "Combined GPS interpolation build started", "product_type": PRODUCT_TYPE_COMBINED_GPS, "product_id": COMBINED_GPS_PRODUCT_ID, "warning": COMBINED_GPS_WARNING, **response}
+
+@app.get("/api/interpolation/combined-gps/plan")
+async def interpolation_combined_plan(start_time_h: float | None = None, end_time_h: float | None = None, current_time_h: float | None = None, entire_day: bool = False, minimum_epoch_ipp_count: int = Query(DEFAULT_MINIMUM_EPOCH_IPP_COUNT, ge=3, le=200), grid_step_deg: float = Query(DEFAULT_GRID_STEP_DEG)) -> dict[str, object]:
+    cache_path = _require_cache_path(); grid_step_deg = _validated_grid_step_or_422(grid_step_deg)
+    plan = build_combined_gps_plan(cache_root=state.cache_dir, daily_cache_path=cache_path, minimum_epoch_ipp_count=minimum_epoch_ipp_count, grid_step_deg=grid_step_deg, start_time_h=None if entire_day else start_time_h, end_time_h=None if entire_day else end_time_h, current_epoch_time_h=current_time_h)
+    geom = prepare_grid_geometry(grid_step_deg); cells = int(len(geom.lat_values)*len(geom.lon_values)); bytes_est = int(max(0, plan["planned_epoch_count"]) * cells * 5)
+    return {"product_type": PRODUCT_TYPE_COMBINED_GPS, "product_id": COMBINED_GPS_PRODUCT_ID, "planned_map_count": plan["planned_epoch_count"], "remaining_map_count": plan["remaining_epoch_count"], "estimated_storage_bytes": bytes_est, "grid_step_deg": grid_step_deg, "grid_lat_count": len(geom.lat_values), "grid_lon_count": len(geom.lon_values), "warning": COMBINED_GPS_WARNING}
+
 @app.post("/api/interpolation/cancel")
 async def interpolation_cancel() -> dict[str, str]:
     await interpolation_state.cancel()
@@ -545,18 +579,32 @@ async def interpolation_summary(minimum_epoch_ipp_count: int = Query(DEFAULT_MIN
         per_arc.append({"prn": arc["prn"], "arc_index": arc["arc_index"], "expected": exp, "ready": r, "failed": f, "status": st, "raw_epoch_count": arc.get("raw_epoch_count", arc["epoch_count"]), "planned_interpolation_count": exp, "low_point_epoch_count": arc.get("low_point_epoch_count", 0)})
     planned=sum(int(a.get("usable_epoch_count", a["epoch_count"])) for a in eligible)
     geom = prepare_grid_geometry(grid_step_deg)
-    return {"eligible_arc_count": len(eligible), "ineligible_arc_count": len(arcs)-len(eligible), "planned_map_count": planned, "ready_map_count": ready, "missing_map_count": max(0, planned-ready-failed), "failed_map_count": failed, "cache_compatible": bool(validation and validation.compatible), "cache_completed": bool(metadata.get("completed", False)), "method": metadata.get("interpolation_method", METHOD), "projection": metadata.get("projection", PROJECTION), "grid_step_deg": float(grid_step_deg), "grid_lat_count": int(len(geom.lat_values)), "grid_lon_count": int(len(geom.lon_values)), "grid_cell_count": int(len(geom.lat_values)*len(geom.lon_values)), "minimum_epoch_ipp_count": minimum_epoch_ipp_count, "arcs": per_arc}
+    combined_entries = [e for e in metadata.get("product_entries", []) if e.get("product_type") == PRODUCT_TYPE_COMBINED_GPS]
+    return {"product_type": PRODUCT_TYPE_PER_PRN, "product_id": "per_prn", "combined_product": (combined_entries[0] if combined_entries else None), "eligible_arc_count": len(eligible), "ineligible_arc_count": len(arcs)-len(eligible), "planned_map_count": planned, "ready_map_count": ready, "missing_map_count": max(0, planned-ready-failed), "failed_map_count": failed, "cache_compatible": bool(validation and validation.compatible), "cache_completed": bool(metadata.get("completed", False)), "method": metadata.get("interpolation_method", METHOD), "projection": metadata.get("projection", PROJECTION), "grid_step_deg": float(grid_step_deg), "grid_lat_count": int(len(geom.lat_values)), "grid_lon_count": int(len(geom.lon_values)), "grid_cell_count": int(len(geom.lat_values)*len(geom.lon_values)), "minimum_epoch_ipp_count": minimum_epoch_ipp_count, "arcs": per_arc}
 
 
 @app.get("/api/interpolation/epoch")
 async def interpolation_epoch(prn: str = Query(...), time_h: float = Query(...), grid_step_deg: float = Query(DEFAULT_GRID_STEP_DEG)) -> dict[str, object]:
     cache_path = _require_cache_path()
     with connect_cache(cache_path) as con:
-        row = con.execute("SELECT epoch_index, time_h FROM prn_epochs WHERE prn = ? ORDER BY ABS(epoch_index - ROUND(? * 120)), time_h LIMIT 1", [prn, time_h]).fetchone()
+        if prn == COMBINED_GPS_PRODUCT_ID:
+            row = con.execute("SELECT epoch_index, AVG(time_h) FROM observations WHERE prn LIKE 'G%' GROUP BY epoch_index ORDER BY ABS(epoch_index - ROUND(? * 120)) LIMIT 1", [time_h]).fetchone()
+        else:
+            row = con.execute("SELECT epoch_index, time_h FROM prn_epochs WHERE prn = ? ORDER BY ABS(epoch_index - ROUND(? * 120)), time_h LIMIT 1", [prn, time_h]).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail=f"No cached epochs are available for PRN {prn}.")
+        raise HTTPException(status_code=404, detail=f"No cached epochs are available for product {prn}.")
     epoch_index, actual_time_h = int(row[0]), float(row[1])
     grid_step_deg = _validated_grid_step_or_422(grid_step_deg)
+    from tid_analyzer.interpolation.orchestrator import _cache_dir_for_daily
+    cache_dir = _cache_dir_for_daily(state.cache_dir, cache_path, grid_step_deg)
+    if prn == COMBINED_GPS_PRODUCT_ID:
+        status = get_combined_epoch_status(cache_dir, epoch_index=epoch_index)
+        if status is None:
+            raise HTTPException(status_code=404, detail=f"No combined GPS interpolation grid is cached for epoch {epoch_index}.")
+        payload = read_combined_epoch_result(cache_dir, epoch_index=epoch_index)
+        base = {"product_type": PRODUCT_TYPE_COMBINED_GPS, "product_id": COMBINED_GPS_PRODUCT_ID, "prn": COMBINED_GPS_PRODUCT_ID, "requested_time_h": time_h, "actual_time_h": actual_time_h, "epoch_index": epoch_index, "available": status == "ready", "method": payload["method"], "projection": payload["projection"], "grid_step_deg": payload["grid_step_deg"], "point_count": payload["point_count"], "raw_ipp_count": payload["raw_ipp_count"], "station_count": payload["station_count"], "prn_count": payload["prn_count"], "status": status, "warning": COMBINED_GPS_WARNING}
+        if status != "ready": return {**base, "message": payload.get("message", "")}
+        return {**base, "lon_values": payload["lon_values"].tolist(), "lat_values": payload["lat_values"].tolist(), "values": payload["values"].tolist(), "valid_mask": payload["valid_mask"].tolist()}
     arcs = [a for a in eligible_arcs_from_daily(cache_path) if str(a["prn"]) == prn and int(round(float(a["start_time_h"])*120)) <= epoch_index <= int(round(float(a["end_time_h"])*120))]
     if not arcs:
         raise HTTPException(status_code=404, detail=f"No interpolation arc contains PRN {prn} epoch {epoch_index}.")
@@ -567,7 +615,7 @@ async def interpolation_epoch(prn: str = Query(...), time_h: float = Query(...),
     if status is None:
         raise HTTPException(status_code=404, detail=f"No interpolation grid is cached for PRN {prn} epoch {epoch_index}.")
     payload = read_epoch_result(cache_dir, prn=prn, arc_index=int(arc["arc_index"]), epoch_index=epoch_index)
-    base = {"prn": prn, "requested_time_h": time_h, "actual_time_h": actual_time_h, "epoch_index": epoch_index, "available": status == "ready", "method": payload["method"], "projection": payload["projection"], "grid_step_deg": payload["grid_step_deg"], "point_count": payload["point_count"], "station_count": payload["station_count"], "status": status}
+    base = {"product_type": PRODUCT_TYPE_PER_PRN, "product_id": prn, "prn": prn, "requested_time_h": time_h, "actual_time_h": actual_time_h, "epoch_index": epoch_index, "available": status == "ready", "method": payload["method"], "projection": payload["projection"], "grid_step_deg": payload["grid_step_deg"], "point_count": payload["point_count"], "station_count": payload["station_count"], "status": status}
     if status != "ready":
         return {**base, "message": payload.get("message", "")}
     return {**base, "lon_values": payload["lon_values"].tolist(), "lat_values": payload["lat_values"].tolist(), "values": payload["values"].tolist(), "valid_mask": payload["valid_mask"].tolist()}

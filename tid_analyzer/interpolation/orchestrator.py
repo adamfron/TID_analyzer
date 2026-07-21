@@ -26,6 +26,10 @@ from tid_analyzer.interpolation.storage import (
     mark_cache_complete,
     read_arc_statuses,
     write_epoch_result,
+    ensure_combined_product,
+    write_combined_epoch_result,
+    get_combined_epoch_status,
+    PRODUCT_TYPE_PER_PRN, PRODUCT_TYPE_COMBINED_GPS, COMBINED_GPS_PRODUCT_ID,
 )
 
 TERMINAL_FAILED = {"failed", "geometry_error"}
@@ -38,6 +42,8 @@ class InterpolationJob:
     arc_index: int
     epoch_index: int
     time_h: float
+    product_type: str = PRODUCT_TYPE_PER_PRN
+    product_id: str | None = None
 
 
 @dataclass
@@ -53,10 +59,10 @@ class InterpolationController:
         self.status = update
         await self.queue.put(update)
 
-    async def start_build(self, *, daily_cache_path: Path, retry_failed: bool = False, force_rebuild: bool = False, prn: str | None = None, arc_index: int | None = None, minimum_epoch_ipp_count: int = DEFAULT_MINIMUM_EPOCH_IPP_COUNT, grid_step_deg: float = DEFAULT_GRID_STEP_DEG) -> dict[str, Any]:
+    async def start_build(self, *, daily_cache_path: Path, retry_failed: bool = False, force_rebuild: bool = False, prn: str | None = None, arc_index: int | None = None, minimum_epoch_ipp_count: int = DEFAULT_MINIMUM_EPOCH_IPP_COUNT, grid_step_deg: float = DEFAULT_GRID_STEP_DEG, product_type: str = PRODUCT_TYPE_PER_PRN, start_time_h: float | None = None, end_time_h: float | None = None, current_epoch_time_h: float | None = None) -> dict[str, Any]:
         if self.task and not self.task.done():
             raise RuntimeError("An interpolation build is already running")
-        plan = build_interpolation_plan(cache_root=self.cache_dir, daily_cache_path=daily_cache_path, retry_failed=retry_failed, force_rebuild=force_rebuild, prn=prn, arc_index=arc_index, minimum_epoch_ipp_count=minimum_epoch_ipp_count, grid_step_deg=grid_step_deg)
+        plan = build_combined_gps_plan(cache_root=self.cache_dir, daily_cache_path=daily_cache_path, retry_failed=retry_failed, force_rebuild=force_rebuild, minimum_epoch_ipp_count=minimum_epoch_ipp_count, grid_step_deg=grid_step_deg, start_time_h=start_time_h, end_time_h=end_time_h, current_epoch_time_h=current_epoch_time_h) if product_type == PRODUCT_TYPE_COMBINED_GPS else build_interpolation_plan(cache_root=self.cache_dir, daily_cache_path=daily_cache_path, retry_failed=retry_failed, force_rebuild=force_rebuild, prn=prn, arc_index=arc_index, minimum_epoch_ipp_count=minimum_epoch_ipp_count, grid_step_deg=grid_step_deg)
         self.cancel_event.clear()
         started_at_utc = datetime.now(timezone.utc)
         started_monotonic = time.monotonic()
@@ -97,9 +103,9 @@ class InterpolationController:
                     done, _ = await loop.run_in_executor(None, lambda: wait(pending, return_when=FIRST_COMPLETED))
                     for fut in done:
                         job = pending.pop(fut)
-                        await self.publish(_status("running", current, total, generated, already_ready, skipped, failed, low_coverage, f"Writing {job.prn} arc {job.arc_index} epoch {job.epoch_index}", job, started_at_utc=started_at_utc, started_monotonic=started_monotonic, grid_step_deg=grid_step_deg))
+                        await self.publish(_status("running", current, total, generated, already_ready, skipped, failed, low_coverage, f"Writing {job.product_type} {job.product_id or job.prn} epoch {job.epoch_index}", job, started_at_utc=started_at_utc, started_monotonic=started_monotonic, grid_step_deg=grid_step_deg))
                         result, result_arc_index = fut.result()
-                        write_epoch_result(cache_dir, result, arc_index=result_arc_index)
+                        write_combined_epoch_result(cache_dir, result) if job.product_type == PRODUCT_TYPE_COMBINED_GPS else write_epoch_result(cache_dir, result, arc_index=result_arc_index)
                         if result.status == "ready":
                             generated += 1
                         elif result.status == "insufficient_points":
@@ -131,7 +137,7 @@ def _status(state: str, current: int, total: int, generated: int, already_ready:
     remaining = (mean * max(0, total - completed)) if mean is not None and completed >= 5 else None
     finish = (datetime.now(timezone.utc) + timedelta(seconds=remaining)).isoformat() if remaining is not None else None
     geom = prepare_grid_geometry(grid_step_deg)
-    return {"operation": "interpolation", "state": state, "grid_step_deg": float(grid_step_deg), "grid_lat_count": int(len(geom.lat_values)), "grid_lon_count": int(len(geom.lon_values)), "current": current, "total": total, "percent": pct, "current_prn": job.prn if job else None, "current_arc_index": job.arc_index if job else None, "current_epoch_index": job.epoch_index if job else None, "generated": generated, "already_ready": already_ready, "skipped": skipped, "skipped_low_station_coverage": low_coverage, "failed": failed, "started_at_utc": started_at_utc.isoformat() if started_at_utc else None, "elapsed_seconds": elapsed, "completed_element_count": completed, "mean_seconds_per_element": mean, "remaining_seconds": remaining, "estimated_finish_utc": finish, "message": message}
+    return {"operation": "interpolation", "state": state, "grid_step_deg": float(grid_step_deg), "grid_lat_count": int(len(geom.lat_values)), "grid_lon_count": int(len(geom.lon_values)), "current": current, "total": total, "percent": pct, "product_type": job.product_type if job else None, "product_id": (job.product_id or job.prn) if job else None, "current_prn": job.prn if job else None, "current_arc_index": job.arc_index if job else None, "current_epoch_index": job.epoch_index if job else None, "generated": generated, "already_ready": already_ready, "skipped": skipped, "skipped_low_station_coverage": low_coverage, "failed": failed, "started_at_utc": started_at_utc.isoformat() if started_at_utc else None, "elapsed_seconds": elapsed, "completed_element_count": completed, "mean_seconds_per_element": mean, "remaining_seconds": remaining, "estimated_finish_utc": finish, "message": message}
 
 
 def _max_workers() -> int:
@@ -254,32 +260,44 @@ def _init_worker(grid_step_deg: float = DEFAULT_GRID_STEP_DEG) -> None:
 
 
 def _prepare_jobs_for_submission(daily_cache_path: Path, jobs: list[InterpolationJob], *, chunk_epochs: int = 64):
-    by_arc: dict[tuple[str, int], list[InterpolationJob]] = {}
+    by_arc: dict[tuple[str, int, str], list[InterpolationJob]] = {}
     for job in jobs:
-        by_arc.setdefault((job.prn, job.arc_index), []).append(job)
-    for (prn, _arc_index), arc_jobs in by_arc.items():
+        by_arc.setdefault((job.prn, job.arc_index, job.product_type), []).append(job)
+    for (prn, _arc_index, product_type), arc_jobs in by_arc.items():
         arc_jobs = sorted(arc_jobs, key=lambda j: j.epoch_index)
         with duckdb.connect(str(daily_cache_path), read_only=True) as con:
             for i in range(0, len(arc_jobs), chunk_epochs):
                 chunk = arc_jobs[i:i + chunk_epochs]
                 wanted = {j.epoch_index: j for j in chunk}
                 t0 = perf_counter()
-                rows = con.execute(
-                    """
-                    SELECT epoch_index, time_h, station, ipp_lon, ipp_lat, dtec
-                    FROM observations
-                    WHERE prn = ? AND epoch_index BETWEEN ? AND ?
-                    ORDER BY epoch_index, station
-                    """,
-                    [prn, min(wanted), max(wanted)],
-                ).fetchall()
+
+                if product_type == PRODUCT_TYPE_COMBINED_GPS:
+                    rows = con.execute(
+                        """
+                        SELECT epoch_index, time_h, station, ipp_lon, ipp_lat, dtec, prn
+                        FROM observations
+                        WHERE prn LIKE 'G%' AND epoch_index BETWEEN ? AND ? AND isfinite(ipp_lon) AND isfinite(ipp_lat) AND isfinite(dtec)
+                        ORDER BY epoch_index, prn, station
+                        """,
+                        [min(wanted), max(wanted)],
+                    ).fetchall()
+                else:
+                    rows = con.execute(
+                        """
+                        SELECT epoch_index, time_h, station, ipp_lon, ipp_lat, dtec, prn
+                        FROM observations
+                        WHERE prn = ? AND epoch_index BETWEEN ? AND ?
+                        ORDER BY epoch_index, station
+                        """,
+                        [prn, min(wanted), max(wanted)],
+                    ).fetchall()
                 query_seconds = perf_counter() - t0
-                grouped: dict[int, list[tuple[Any, float, float, float]]] = {epoch: [] for epoch in wanted}
+                grouped: dict[int, list[tuple[Any, float, float, float, str]]] = {epoch: [] for epoch in wanted}
                 times = {epoch: wanted[epoch].time_h for epoch in wanted}
-                for epoch_index, time_h, station, lon, lat, dtec in rows:
+                for epoch_index, time_h, station, lon, lat, dtec, row_prn in rows:
                     epoch_index = int(epoch_index)
                     if epoch_index in grouped:
-                        grouped[epoch_index].append((station, lon, lat, dtec))
+                        grouped[epoch_index].append((station, lon, lat, dtec, row_prn))
                         times[epoch_index] = float(time_h)
                 for job in chunk:
                     yield job, times[job.epoch_index], grouped[job.epoch_index], query_seconds / max(1, len(chunk))
@@ -291,4 +309,46 @@ def _compute_prepared_job(payload):
     data = [{"station": r[0], "ipp_lon": r[1], "ipp_lat": r[2], "dtec": r[3]} for r in rows]
     result = interpolate_prn_epoch_natural_neighbor(prn=job.prn, epoch_index=job.epoch_index, time_h=time_h, rows=data, grid_geometry=geometry)
     result.timings["database_query"] = float(database_query_seconds)
+    if job.product_type == PRODUCT_TYPE_COMBINED_GPS:
+        return {**result.__dict__, "product_type": PRODUCT_TYPE_COMBINED_GPS, "product_id": COMBINED_GPS_PRODUCT_ID, "prn": COMBINED_GPS_PRODUCT_ID, "raw_ipp_count": len(rows), "station_count": len({str(r[0]) for r in rows}), "prn_count": len({str(r[4]) for r in rows})}, 0
     return result, job.arc_index
+
+
+def build_combined_gps_plan(*, cache_root: Path, daily_cache_path: Path, retry_failed: bool = False, force_rebuild: bool = False, minimum_epoch_ipp_count: int = 100, grid_step_deg: float = DEFAULT_GRID_STEP_DEG, start_time_h: float | None = None, end_time_h: float | None = None, current_epoch_time_h: float | None = None) -> dict[str, Any]:
+    year, doy, elev = _daily_metadata(daily_cache_path)
+    cache_dir = _cache_dir_for_daily(cache_root, daily_cache_path, grid_step_deg)
+    if force_rebuild and (cache_dir / "products" / "combined_gps.zarr").exists():
+        shutil.rmtree(cache_dir / "products" / "combined_gps.zarr")
+    clauses = ["prn LIKE 'G%'", "isfinite(ipp_lon)", "isfinite(ipp_lat)", "isfinite(dtec)"]; params: list[Any] = []
+    if current_epoch_time_h is not None:
+        with connect_cache(daily_cache_path) as con:
+            row = con.execute("SELECT epoch_index FROM observations WHERE prn LIKE 'G%' ORDER BY ABS(epoch_index - ROUND(? * 120)) LIMIT 1", [current_epoch_time_h]).fetchone()
+        if row is None:
+            return {"jobs": [], "eligible_arc_count": 0, "planned_epoch_count": 0, "already_ready_count": 0, "remaining_epoch_count": 0, "low_coverage_count": 0}
+        clauses.append("epoch_index = ?"); params.append(int(row[0]))
+    else:
+        if start_time_h is not None: clauses.append("time_h >= ?"); params.append(float(start_time_h))
+        if end_time_h is not None: clauses.append("time_h <= ?"); params.append(float(end_time_h))
+    where = " AND ".join(clauses)
+    with connect_cache(daily_cache_path) as con:
+        rows = con.execute(f"""
+            SELECT epoch_index, AVG(time_h), COUNT(*) raw_ipp_count, COUNT(DISTINCT station), COUNT(DISTINCT prn)
+            FROM observations WHERE {where}
+            GROUP BY epoch_index ORDER BY epoch_index
+        """, params).fetchall()
+    if start_time_h is None and end_time_h is None and current_epoch_time_h is None:
+        expected = len(rows)
+    else:
+        expected = len(rows)
+    cache_dir = create_or_open_interpolation_cache(cache_root=cache_root, daily_cache_path=daily_cache_path, year=year, doy=doy, minimum_elevation_deg=elev, arcs=[], minimum_epoch_ipp_count=minimum_epoch_ipp_count, grid_step_deg=grid_step_deg)
+    ensure_combined_product(cache_dir, expected_epoch_count=expected, minimum_epoch_ipp_count=minimum_epoch_ipp_count)
+    jobs=[]; already=low=skipped=0
+    for epoch_index, time_h, raw_count, _station_count, _prn_count in rows:
+        epoch_index = int(epoch_index)
+        if int(raw_count) < minimum_epoch_ipp_count:
+            low += 1; continue
+        status = get_combined_epoch_status(cache_dir, epoch_index=epoch_index)
+        if status == "ready": already += 1; continue
+        if status in FAILED_STATUSES and not retry_failed: skipped += 1; continue
+        jobs.append(InterpolationJob(COMBINED_GPS_PRODUCT_ID, 0, epoch_index, float(time_h), PRODUCT_TYPE_COMBINED_GPS, COMBINED_GPS_PRODUCT_ID))
+    return {"jobs": jobs, "eligible_arc_count": 1 if rows else 0, "planned_epoch_count": len(jobs)+already+skipped+low, "already_ready_count": already, "remaining_epoch_count": len(jobs), "low_coverage_count": low, "product_type": PRODUCT_TYPE_COMBINED_GPS, "product_id": COMBINED_GPS_PRODUCT_ID}

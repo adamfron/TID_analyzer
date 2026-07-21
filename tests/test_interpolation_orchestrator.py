@@ -116,3 +116,28 @@ def test_simultaneous_builds_are_rejected_before_planning(tmp_path: Path) -> Non
             controller.task.cancel()
 
     asyncio.run(run())
+
+
+def test_combined_gps_plan_uses_all_gps_and_excludes_non_gps(tmp_path: Path) -> None:
+    rows = _rows("G24", epochs=[0.0], stations=3) + _rows("G25", epochs=[0.0], stations=2) + _rows("R01", epochs=[0.0], stations=4)
+    daily = _daily(tmp_path, rows)
+    from tid_analyzer.interpolation.orchestrator import build_combined_gps_plan
+    plan = build_combined_gps_plan(cache_root=tmp_path / "cache", daily_cache_path=daily, minimum_epoch_ipp_count=5)
+    assert plan["product_type"] == "combined_gps"
+    assert [(j.product_type, j.product_id, j.prn, j.epoch_index) for j in plan["jobs"]] == [("combined_gps", "GPS_ALL", "GPS_ALL", 0)]
+
+
+def test_combined_gps_selected_window_planning_and_resume(tmp_path: Path) -> None:
+    rows = _rows("G24", epochs=[0.0, 1.0, 2.0], stations=3) + _rows("G25", epochs=[0.0, 1.0, 2.0], stations=3)
+    daily = _daily(tmp_path, rows)
+    from tid_analyzer.interpolation.orchestrator import build_combined_gps_plan, _cache_dir_for_daily
+    from tid_analyzer.interpolation.storage import ensure_combined_product, write_combined_epoch_result
+    plan = build_combined_gps_plan(cache_root=tmp_path / "cache", daily_cache_path=daily, minimum_epoch_ipp_count=3, start_time_h=0.5, end_time_h=1.5)
+    assert [j.epoch_index for j in plan["jobs"]] == [120]
+    cache_dir = _cache_dir_for_daily(tmp_path / "cache", daily, 1.0)
+    ensure_combined_product(cache_dir, expected_epoch_count=1, minimum_epoch_ipp_count=3)
+    r = _result(120).__dict__ | {"product_type":"combined_gps", "product_id":"GPS_ALL", "prn":"GPS_ALL", "raw_ipp_count":6, "station_count":3, "prn_count":2}
+    write_combined_epoch_result(cache_dir, r)
+    resumed = build_combined_gps_plan(cache_root=tmp_path / "cache", daily_cache_path=daily, minimum_epoch_ipp_count=3, start_time_h=0.5, end_time_h=1.5)
+    assert resumed["already_ready_count"] == 1
+    assert resumed["jobs"] == []
