@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -14,7 +15,8 @@ if TYPE_CHECKING:
     from tid_analyzer.importer.parser import StationRow
 
 OBS_COLUMNS = "station, prn, time_h, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat"
-CACHE_VERSION = "duckdb_daily_v5"
+CACHE_VERSION = "duckdb_daily_v6"
+PARSER_VERSION = "parser_v2"
 
 
 def epoch_index_for_time(time_h: float, step_seconds: int = 30) -> int:
@@ -66,7 +68,12 @@ def create_schema(con: duckdb.DuckDBPyConnection) -> None:
             out_of_bounds_rows BIGINT,
             valid_row_count BIGINT,
             status VARCHAR,
-            error_message VARCHAR
+            error_message VARCHAR,
+            relative_filename VARCHAR,
+            byte_size BIGINT,
+            mtime_ns BIGINT,
+            sha256 VARCHAR,
+            normalized_observation_digest VARCHAR
         )
     """)
     con.execute("""
@@ -84,10 +91,44 @@ def create_metadata_table(con: duckdb.DuckDBPyConnection) -> None:
             source_folder VARCHAR, year INTEGER, doy INTEGER, min_elevation_deg DOUBLE,
             lon_min DOUBLE, lon_max DOUBLE, lat_min DOUBLE, lat_max DOUBLE,
             source_file_count INTEGER, total_rows_seen BIGINT, valid_rows_stored BIGINT,
-            created_at VARCHAR, completed BOOLEAN, application_cache_version VARCHAR
+            created_at VARCHAR, completed BOOLEAN, application_cache_version VARCHAR,
+            parser_version VARCHAR, source_content_digest VARCHAR, imported_observation_digest VARCHAR,
+            authoritative_fingerprint VARCHAR, import_filters_json VARCHAR, grid_resolution_deg DOUBLE
         )
     """)
 
+
+
+
+def ensure_identity_columns(con: duckdb.DuckDBPyConnection) -> None:
+    for table, columns in {
+        "imported_files": {
+            "relative_filename": "VARCHAR", "byte_size": "BIGINT", "mtime_ns": "BIGINT", "sha256": "VARCHAR", "normalized_observation_digest": "VARCHAR",
+        },
+        "metadata": {
+            "parser_version": "VARCHAR", "source_content_digest": "VARCHAR", "imported_observation_digest": "VARCHAR",
+            "authoritative_fingerprint": "VARCHAR", "import_filters_json": "VARCHAR", "grid_resolution_deg": "DOUBLE",
+        },
+    }.items():
+        existing = {r[1] for r in con.execute(f"PRAGMA table_info('{table}')").fetchall()}
+        for name, typ in columns.items():
+            if name not in existing:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
+
+
+def canonical_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def aggregate_digest(values: Iterable[str]) -> str:
+    h = hashlib.sha256()
+    for value in sorted(str(v) for v in values if v):
+        h.update(value.encode("utf-8")); h.update(b"\n")
+    return h.hexdigest()
+
+
+def authoritative_fingerprint(payload: dict[str, object]) -> str:
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 def csv_relation_sql(path: Path) -> str:
     safe_path = str(path).replace("'", "''")
@@ -165,20 +206,27 @@ def cache_is_valid(cache_path: Path, folder: Path, files: list[Path], year: int 
     if not cache_path.exists():
         return False
     try:
-        with duckdb.connect(str(cache_path), read_only=True) as con:
-            row = con.execute("SELECT source_folder, year, doy, min_elevation_deg, lon_min, lon_max, lat_min, lat_max, source_file_count, completed, application_cache_version, valid_rows_stored FROM metadata LIMIT 1").fetchone()
-            if row is None:
+        with duckdb.connect(str(cache_path)) as con:
+            ensure_identity_columns(con)
+            row = con.execute("SELECT year, doy, min_elevation_deg, lon_min, lon_max, lat_min, lat_max, source_file_count, completed, application_cache_version, valid_rows_stored, source_content_digest, imported_observation_digest, parser_version, import_filters_json FROM metadata LIMIT 1").fetchone()
+            if row is None or not row[11] or not row[12]:
                 return False
+            file_rows = con.execute("SELECT relative_filename, byte_size, mtime_ns FROM imported_files ORDER BY relative_filename").fetchall()
+            current = []
+            for path in files:
+                st = path.stat()
+                current.append((path.name, int(st.st_size), int(st.st_mtime_ns)))
             return (
-                Path(str(row[0])) == folder and row[1] == year and row[2] == doy
-                and float(row[3]) == float(filters.min_elevation_deg)
-                and float(row[4]) == filters.lon_min and float(row[5]) == filters.lon_max
-                and float(row[6]) == filters.lat_min and float(row[7]) == filters.lat_max
-                and int(row[8]) == len(files) and bool(row[9]) and str(row[10]) == CACHE_VERSION and int(row[11] or 0) > 0
+                row[0] == year and row[1] == doy
+                and float(row[2]) == float(filters.min_elevation_deg)
+                and float(row[3]) == filters.lon_min and float(row[4]) == filters.lon_max
+                and float(row[5]) == filters.lat_min and float(row[6]) == filters.lat_max
+                and int(row[7]) == len(files) and bool(row[8]) and str(row[9]) == CACHE_VERSION and int(row[10] or 0) > 0
+                and str(row[13]) == PARSER_VERSION and str(row[14] or "") == canonical_json(filters.as_manifest_dict())
+                and sorted(file_rows) == sorted(current)
             )
     except duckdb.Error:
         return False
-
 
 def create_daily_cache(cache_path: Path, rows: Iterable["StationRow"], metadata: dict[str, object], filters: ImportFilters) -> None:
     # Reference/fallback implementation retained for tests and malformed files.
@@ -186,11 +234,11 @@ def create_daily_cache(cache_path: Path, rows: Iterable["StationRow"], metadata:
     if cache_path.exists():
         cache_path.unlink()
     with duckdb.connect(str(cache_path)) as con:
-        configure_connection(con); create_schema(con); create_metadata_table(con)
+        configure_connection(con); create_schema(con); create_metadata_table(con); ensure_identity_columns(con)
         con.executemany(f"INSERT INTO observations ({OBS_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [row_to_record(r, filters) for r in rows])
         finalize_cache(con)
-        con.execute("INSERT INTO metadata VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [metadata.get("source_folder"), metadata.get("year"), metadata.get("doy"), filters.min_elevation_deg, filters.lon_min, filters.lon_max, filters.lat_min, filters.lat_max, metadata.get("source_file_count", 0), metadata.get("total_rows_seen", 0), metadata.get("valid_rows", 0), datetime.now(timezone.utc).isoformat(), True, CACHE_VERSION])
+        con.execute("INSERT INTO metadata (source_folder, year, doy, min_elevation_deg, lon_min, lon_max, lat_min, lat_max, source_file_count, total_rows_seen, valid_rows_stored, created_at, completed, application_cache_version, parser_version, import_filters_json, grid_resolution_deg) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [metadata.get("source_folder"), metadata.get("year"), metadata.get("doy"), filters.min_elevation_deg, filters.lon_min, filters.lon_max, filters.lat_min, filters.lat_max, metadata.get("source_file_count", 0), metadata.get("total_rows_seen", 0), metadata.get("valid_rows", 0), datetime.now(timezone.utc).isoformat(), True, CACHE_VERSION, PARSER_VERSION, canonical_json(filters.as_manifest_dict()), metadata.get("grid_resolution_deg", 1.0)])
 
 
 def connect_cache(cache_path: Path) -> duckdb.DuckDBPyConnection:
-    return duckdb.connect(str(cache_path), read_only=True)
+    return duckdb.connect(str(cache_path))

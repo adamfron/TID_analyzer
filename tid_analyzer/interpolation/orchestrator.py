@@ -21,6 +21,7 @@ from tid_analyzer.interpolation.natural_neighbor import DEFAULT_GRID_STEP_DEG, M
 from tid_analyzer.interpolation.storage import (
     ArcDescriptor,
     create_or_open_interpolation_cache,
+    create_source_fingerprint,
     interpolation_cache_dir,
     mark_cache_complete,
     read_arc_statuses,
@@ -153,7 +154,9 @@ def _daily_metadata(daily_cache_path: Path) -> tuple[int, int, float]:
 
 def _cache_dir_for_daily(cache_root: Path, daily_cache_path: Path, grid_step_deg: float = DEFAULT_GRID_STEP_DEG) -> Path:
     y, d, elev = _daily_metadata(daily_cache_path)
-    return interpolation_cache_dir(cache_root, y, d, elev, grid_step_deg)
+    fp = create_source_fingerprint(daily_cache_path=daily_cache_path, year=y, doy=d, minimum_elevation_deg=elev, grid_step_deg=grid_step_deg)
+    digest = str(fp.get("source_content_digest") or fp.get("authoritative_fingerprint") or "")
+    return interpolation_cache_dir(cache_root, y, d, elev, grid_step_deg, digest or None)
 
 
 def eligible_arcs_from_daily(daily_cache_path: Path, gap_minutes: float = 10.0, min_stations: int = 100, min_duration_min: float = 120.0, minimum_epoch_ipp_count: int = 100) -> list[dict[str, Any]]:
@@ -199,7 +202,7 @@ def build_interpolation_plan(*, cache_root: Path, daily_cache_path: Path, retry_
     if prn is not None:
         eligible = [a for a in eligible if str(a.get("prn")) == prn and (arc_index is None or int(a.get("arc_index", -1)) == arc_index)]
     descriptors = [ArcDescriptor(str(a["prn"]), int(a["arc_index"]), int(a.get("usable_epoch_count", a["epoch_count"]))) for a in eligible]
-    cache_dir = interpolation_cache_dir(cache_root, year, doy, elev, grid_step_deg)
+    cache_dir = _cache_dir_for_daily(cache_root, daily_cache_path, grid_step_deg)
     if force_rebuild and cache_dir.exists():
         shutil.rmtree(cache_dir)
     cache_dir = create_or_open_interpolation_cache(cache_root=cache_root, daily_cache_path=daily_cache_path, year=year, doy=doy, minimum_elevation_deg=elev, arcs=descriptors, minimum_epoch_ipp_count=minimum_epoch_ipp_count, grid_step_deg=grid_step_deg)
