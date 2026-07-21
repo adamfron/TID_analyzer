@@ -13,7 +13,7 @@ assert.match(src, /img\.data\[k\+3\]=Math\.round\(255\*band\.alpha\*multiplier\)
 
 assert.ok(!src.includes('rects.push(<rect'), 'twilight shading no longer renders one SVG rectangle per solar grid cell');
 assert.match(src, /document\.createElement\('canvas'\)/, 'twilight shading renders through an off-screen canvas image');
-assert.match(src, /solarElevationAt\(lon,lat,lons,lats,vals\)/, 'canvas classification uses bilinearly interpolated solar elevation');
+assert.match(src, /solarElevationAt\(lon,lat,solar\)/, 'canvas classification uses unrestricted subsolar-point solar elevation');
 assert.match(src, /<image className="twilightImage" href=\{href\} x=\{plotRect\.x\} y=\{plotRect\.y\} width=\{plotRect\.width\} height=\{plotRect\.height\}/, 'twilight image is aligned to the same map viewport rectangle used by other geolayers and export');
 assert.match(css, /\.twilightShading \.twilightImage \{ pointer-events: none; image-rendering: auto; \}/, 'twilight image has no cell-border crisp-edge styling');
 

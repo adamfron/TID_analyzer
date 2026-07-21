@@ -270,3 +270,4 @@ tbody tr.selectedArc.ineligibleArc { background: #fee2e2; }
 .savedSetRow { display: grid; gap: 3px; padding: 6px 0; border-top: 1px solid #e2e8f0; font-size: 12px; }
 .savedSetRow b { color: #24364b; }
 .savedSetRow em { color: #516172; font-style: normal; }
+.solarContours path { stroke-linejoin: round; stroke-linecap: round; }
