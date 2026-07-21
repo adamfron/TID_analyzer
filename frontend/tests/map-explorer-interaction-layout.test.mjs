@@ -9,7 +9,7 @@ assert.match(src, /const EUROPE_VIEWPORT: Viewport = \{ lon_min: -20, lon_max: 5
 assert.match(src, /function zoomViewport[\s\S]*lon-fx\*nextLon[\s\S]*lat-fy\*nextLat/, 'zoom is centered on the cursor longitude/latitude');
 assert.match(src, /onWheel=\{[\s\S]*e\.preventDefault\(\)[\s\S]*zoom\(e\.deltaY<0\?0\.8:1\.25,g\.lon,g\.lat\)/, 'wheel zoom prevents page scrolling and zooms around cursor');
 assert.match(src, /function panViewport[\s\S]*lon_min:v\.lon_min\+dLon[\s\S]*lat_min:v\.lat_min\+dLat/, 'pan updates viewport bounds');
-assert.match(src, /onDoubleClick=\{\(\)=>setViewport\?\.\(EUROPE_VIEWPORT\)\}/, 'double click resets Europe extent');
+assert.match(src, /onDoubleClick=\{\(\)=>setViewport\?\.\(rasterViewport\(raster\)\)\}/, 'double click resets the active raster extent');
 for (const label of ['Zoom in','Zoom out','Reset view']) assert.ok(src.includes(`>${label}</button>`), `${label} button exists`);
 assert.match(src, /className="stationHitTarget" onClick=\{\(\)=>onStationClick\(m\.station, prn\)\}/, 'station selection uses station marker coordinates and expanded hit target');
 assert.match(src, /<circle cx=\{sx\} cy=\{sy\} r=\{Math\.max\(8, display\.stationMarkerSize\)\} className="stationHitTarget"/, 'station hit target is about 14 px diameter');

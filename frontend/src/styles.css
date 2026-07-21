@@ -258,3 +258,10 @@ tbody tr.selectedArc.ineligibleArc { background: #fee2e2; }
 .stationMarker .stationStar { fill: rgba(248,250,252,.82); stroke: #4b5563; stroke-width: 1.4; pointer-events: none; }
 .stationMarker .stationHalo { fill: none; stroke: #f59e0b; stroke-width: 2.4; pointer-events: none; }
 .stationRays line { stroke: #64748b; stroke-width: var(--ray-width, .8); opacity: var(--ray-opacity, .3); pointer-events: none; }
+.solarLegendLine { width: 34px; height: 10px; flex: 0 0 34px; overflow: visible; background: rgba(255,255,255,.72); border-radius: 3px; }
+.solarLegendLine line { fill: none; stroke-width: 2.4; vector-effect: non-scaling-stroke; }
+.solarLegendLine .solarHorizon { stroke: #f59e0b; }
+.solarLegendLine .solarCivil { stroke: #60a5fa; stroke-dasharray: 5 3; }
+.solarLegendLine .solarNautical { stroke: #2563eb; stroke-dasharray: 4 4; }
+.solarLegendLine .solarAstronomical { stroke: #1e3a8a; stroke-dasharray: 2 3; }
+.solarLegendLine .solarIono { stroke: #7c3aed; stroke-dasharray: 7 3; }
