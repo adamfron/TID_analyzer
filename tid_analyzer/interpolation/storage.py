@@ -206,6 +206,20 @@ def write_epoch_result(cache_dir: Path, result: NaturalNeighborResult | dict[str
     _refresh_arc_metadata(cache_dir, str(r["prn"]), arc_index)
 
 
+def write_epoch_results(cache_dir: Path, results: Iterable[NaturalNeighborResult | dict[str, Any]], *, arc_index: int | None = None) -> None:
+    for result in results:
+        r = result if isinstance(result, dict) else result.__dict__
+        write_epoch_result(cache_dir, result, arc_index=int(arc_index if arc_index is not None else r["arc_index"]))
+
+
+def read_arc_statuses(cache_dir: Path, *, prn: str, arc_index: int) -> dict[int, str]:
+    path = cache_dir / f"{prn}_arc_{arc_index}.zarr"
+    if not path.exists():
+        return {}
+    group = zarr.open_group(str(path), mode="r")
+    return {idx: _decode(value) for idx, value in enumerate(group["status"][:])}
+
+
 def has_epoch_result(cache_dir: Path, *, prn: str, arc_index: int, epoch_index: int) -> bool:
     path = cache_dir / f"{prn}_arc_{arc_index}.zarr"
     if not path.exists():

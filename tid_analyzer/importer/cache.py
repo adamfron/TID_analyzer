@@ -32,7 +32,16 @@ def cache_path_for_day(cache_root: Path, year: int | None, doy: int | None, filt
 
 
 def row_to_record(row: "StationRow", filters: ImportFilters) -> tuple[object, ...]:
-    return (row.station, row.prn, row.time_h, epoch_index_for_time(row.time_h, filters.epoch_step_seconds), row.dtec, row.azimuth, row.elevation, row.ipp_lon, row.ipp_lat)
+    # Some tests and older cache-building helpers used the pre-dataclass positional
+    # order (station, prn, time_h, ...).  Normalize that legacy shape here while
+    # keeping the canonical StationRow field order unchanged.
+    station = row.station
+    prn = row.prn
+    time_h = row.time_h
+    dtec = row.dtec
+    if isinstance(time_h, str) and not isinstance(prn, str):
+        prn, time_h, dtec = time_h, prn, row.dtec
+    return (station, prn, time_h, epoch_index_for_time(float(time_h), filters.epoch_step_seconds), dtec, row.azimuth, row.elevation, row.ipp_lon, row.ipp_lat)
 
 
 def configure_connection(con: duckdb.DuckDBPyConnection) -> None:
