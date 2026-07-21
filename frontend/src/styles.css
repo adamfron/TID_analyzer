@@ -265,3 +265,8 @@ tbody tr.selectedArc.ineligibleArc { background: #fee2e2; }
 .solarLegendLine .solarNautical { stroke: #2563eb; stroke-dasharray: 4 4; }
 .solarLegendLine .solarAstronomical { stroke: #1e3a8a; stroke-dasharray: 2 3; }
 .solarLegendLine .solarIono { stroke: #7c3aed; stroke-dasharray: 7 3; }
+.savedSets { border: 1px solid #d8e0ea; border-radius: 8px; padding: 8px; margin-bottom: 10px; background: #f8fbff; }
+.savedSets h3 { margin: 0 0 6px; font-size: 13px; }
+.savedSetRow { display: grid; gap: 3px; padding: 6px 0; border-top: 1px solid #e2e8f0; font-size: 12px; }
+.savedSetRow b { color: #24364b; }
+.savedSetRow em { color: #516172; font-style: normal; }

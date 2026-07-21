@@ -24,6 +24,8 @@ from tid_analyzer.interpolation.natural_neighbor import METHOD, PROJECTION, DEFA
 from tid_analyzer.importer.cache import connect_cache
 from tid_analyzer.importer.parser import StationRow, build_manifest, iter_station_files, iter_valid_rows
 from tid_analyzer.solar import solar_geometry_from_manifest
+from tid_analyzer.analysis_sets import create_set, delete_set, duplicate_set, list_sets, load_set, rename_set, save_set
+from tid_analyzer.importer.verification import verify_daily_cache
 
 app = FastAPI(title="TID Analyzer API")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -51,6 +53,17 @@ class InterpolationBuildRequest(BaseModel):
 class InterpolationBuildArcRequest(InterpolationBuildRequest):
     prn: str
     arc_index: int
+
+
+class AnalysisSetRequest(BaseModel):
+    name: str = "Analysis set"
+    description: str = ""
+    grid_step_deg: float = DEFAULT_GRID_STEP_DEG
+    minimum_epoch_ipp_count: int = DEFAULT_MINIMUM_EPOCH_IPP_COUNT
+
+
+class RenameSetRequest(BaseModel):
+    name: str
 
 
 class SpectralRequest(BaseModel):
@@ -573,6 +586,56 @@ async def select_folder() -> dict[str, str | None]:
         raise HTTPException(status_code=500, detail=f"Could not open folder selection dialog: {exc}") from exc
     return {"folder_path": folder or None}
 
+
+
+@app.get("/api/analysis-sets")
+async def analysis_sets_list() -> dict[str, object]:
+    return {"sets": list_sets(state.cache_dir)}
+
+
+@app.post("/api/analysis-sets")
+async def analysis_sets_save(request: AnalysisSetRequest) -> dict[str, object]:
+    manifest = state.manifest or {}
+    source_fp = manifest.get("source_fingerprint")
+    cache_products = []
+    if state.cache_path:
+        from tid_analyzer.interpolation.orchestrator import _cache_dir_for_daily
+        cache_products.append(str(_cache_dir_for_daily(state.cache_dir, state.cache_path, request.grid_step_deg)))
+    return create_set(state.cache_dir, name=request.name, description=request.description, source_fingerprint=str(source_fp) if source_fp else None, grid_step=request.grid_step_deg, minimum_epoch_ipp_count=request.minimum_epoch_ipp_count, cache_products=cache_products)
+
+
+@app.get("/api/analysis-sets/{set_id}")
+async def analysis_sets_open(set_id: str) -> dict[str, object]:
+    return load_set(state.cache_dir, set_id)
+
+
+@app.post("/api/analysis-sets/{set_id}/rename")
+async def analysis_sets_rename(set_id: str, request: RenameSetRequest) -> dict[str, object]:
+    return rename_set(state.cache_dir, set_id, request.name)
+
+
+@app.post("/api/analysis-sets/{set_id}/duplicate")
+async def analysis_sets_duplicate(set_id: str, request: RenameSetRequest | None = None) -> dict[str, object]:
+    return duplicate_set(state.cache_dir, set_id, request.name if request else None)
+
+
+@app.delete("/api/analysis-sets/{set_id}")
+async def analysis_sets_delete(set_id: str) -> dict[str, str]:
+    delete_set(state.cache_dir, set_id)
+    return {"status": "deleted"}
+
+
+@app.post("/api/analysis-sets/{set_id}/verify")
+async def analysis_sets_verify(set_id: str, mode: str = Query("fast")) -> dict[str, object]:
+    cache_path = _require_cache_path()
+    result = verify_daily_cache(cache_path, state.source_folder, mode="full" if mode == "full" else "fast")
+    m = load_set(state.cache_dir, set_id); m["verification_status"] = result.state; m["stale"] = result.state == "changed"; save_set(state.cache_dir, m)
+    return result.__dict__
+
+
+@app.get("/api/analysis-sets/{set_id}/location")
+async def analysis_sets_location(set_id: str) -> dict[str, str]:
+    return {"manifest_path": str((state.cache_dir / "analysis_sets" / set_id / "manifest.json").resolve())}
 
 import_subscribers: set[WebSocket] = set()
 

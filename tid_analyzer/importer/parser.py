@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -11,7 +12,7 @@ from typing import Callable, Iterator
 
 from tid_analyzer.config import ImportFilters
 from tid_analyzer.stations.catalog import resolve_stations, station_code_from_filename
-from tid_analyzer.importer.cache import CACHE_VERSION, cache_is_valid, cache_path_for_day, configure_connection, create_metadata_table, create_schema, finalize_cache, source_file_sql, row_to_record, parsed_relation_sql, parsed_valid_expr, normalized_prn_expr
+from tid_analyzer.importer.cache import CACHE_VERSION, PARSER_VERSION, aggregate_digest, authoritative_fingerprint, cache_is_valid, cache_path_for_day, canonical_json, configure_connection, create_metadata_table, create_schema, ensure_identity_columns, finalize_cache, source_file_sql, row_to_record, parsed_relation_sql, parsed_valid_expr, normalized_prn_expr
 
 ProgressCallback = Callable[[str, int, int, str], None]
 CancelCallback = Callable[[], bool]
@@ -186,6 +187,38 @@ def _detect_day(files: list[Path]) -> tuple[set[int], set[int]]:
 
 
 
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _normalized_observation_digest(con, path: Path, filters: ImportFilters) -> str:
+    rows = con.execute(f"SELECT station, prn, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat FROM ({source_file_sql(path, station_from_filename(path), filters)}) ORDER BY station, prn, epoch_index, dtec, azimuth, elevation, ipp_lon, ipp_lat").fetchall()
+    h = hashlib.sha256()
+    for row in rows:
+        h.update(canonical_json(list(row)).encode("utf-8")); h.update(b"\n")
+    return h.hexdigest()
+
+
+def _identity_payload(*, source_content_digest: str, imported_observation_digest: str, filters: ImportFilters, year: int | None, doy: int | None, grid_resolution_deg: float = 1.0) -> dict[str, object]:
+    return {
+        "source_content_digest": source_content_digest,
+        "imported_observation_digest": imported_observation_digest,
+        "parser_version": PARSER_VERSION,
+        "application_cache_version": CACHE_VERSION,
+        "interpolation_method": "natural_neighbor",
+        "import_filters": filters.as_manifest_dict(),
+        "year": year,
+        "doy": doy,
+        "minimum_elevation_deg": filters.min_elevation_deg,
+        "geographic_bounds": {"lon_min": filters.lon_min, "lon_max": filters.lon_max, "lat_min": filters.lat_min, "lat_max": filters.lat_max},
+        "grid_resolution_deg": grid_resolution_deg,
+    }
+
 def extract_station_codes(files: list[Path]) -> list[str]:
     return sorted({station_from_filename(path) for path in files})
 
@@ -280,7 +313,8 @@ def _fallback_import_file(con, path: Path, filters: ImportFilters) -> ImportCoun
 
 def _manifest_from_cache(folder: Path, cache_path: Path, filters: ImportFilters) -> dict[str, object]:
     with duckdb.connect(str(cache_path), read_only=True) as con:
-        meta = con.execute("SELECT source_folder, year, doy, source_file_count, total_rows_seen, valid_rows_stored FROM metadata LIMIT 1").fetchone()
+        ensure_identity_columns(con)
+        meta = con.execute("SELECT source_folder, year, doy, source_file_count, total_rows_seen, valid_rows_stored, source_content_digest, imported_observation_digest, authoritative_fingerprint, parser_version FROM metadata LIMIT 1").fetchone()
         stats = con.execute("""
             SELECT COUNT(DISTINCT station), LIST(DISTINCT station ORDER BY station), LIST(DISTINCT prn ORDER BY prn),
                    MIN(time_h), MAX(time_h), MIN(ipp_lon), MAX(ipp_lon), MIN(ipp_lat), MAX(ipp_lat)
@@ -318,6 +352,7 @@ def _manifest_from_cache(folder: Path, cache_path: Path, filters: ImportFilters)
             "valid_rows_stored": int(diag[6] or 0),
         },
         "applied_filters": filters.as_manifest_dict(), "cache_path": str(cache_path),
+        "source_content_digest": meta[6], "imported_observation_digest": meta[7], "source_fingerprint": meta[8], "parser_version": meta[9],
     }
 
 
@@ -348,7 +383,7 @@ def build_manifest(folder: Path, cache_dir: Path, filters: ImportFilters | None 
     with duckdb.connect(str(cache_path)) as con:
         configure_connection(con)
         _progress(progress, "resolving_stations", 0, max(len(station_codes), 1), "[2/7] Resolving station coordinates")
-        create_schema(con); create_metadata_table(con)
+        create_schema(con); create_metadata_table(con); ensure_identity_columns(con)
         resolved_count, station_total = populate_stations_table(con, station_codes, cache_dir)
         _progress(progress, "stations_resolved", resolved_count, max(station_total, 1), f"[2/7] Station catalogue ready: resolved {resolved_count} of {station_total} station coordinates")
         _progress(progress, "preparing_database", 0, 1, "[3/7] Preparing daily database")
@@ -358,8 +393,10 @@ def build_manifest(folder: Path, cache_dir: Path, filters: ImportFilters | None 
         if unexpected:
             _progress(progress, "preparing_database", 0, 1, f"[3/7] Preparing daily database; {len(unexpected)} filename(s) do not match STATION_YYYY_DOY.txt")
         con.execute("DELETE FROM metadata")
-        con.execute("INSERT INTO metadata VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [str(folder), year, doy, filters.min_elevation_deg, filters.lon_min, filters.lon_max, filters.lat_min, filters.lat_max, len(files), 0, 0, datetime.now(timezone.utc).isoformat(), False, CACHE_VERSION])
+        con.execute("INSERT INTO metadata (source_folder, year, doy, min_elevation_deg, lon_min, lon_max, lat_min, lat_max, source_file_count, total_rows_seen, valid_rows_stored, created_at, completed, application_cache_version, parser_version, import_filters_json, grid_resolution_deg) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [str(folder), year, doy, filters.min_elevation_deg, filters.lon_min, filters.lon_max, filters.lat_min, filters.lat_max, len(files), 0, 0, datetime.now(timezone.utc).isoformat(), False, CACHE_VERSION, PARSER_VERSION, canonical_json(filters.as_manifest_dict()), 1.0])
         _progress(progress, "preparing_database", 1, 1, "[3/7] Daily database ready")
+        file_sha_values: list[str] = []
+        file_obs_digests: list[str] = []
         for index, path in enumerate(files, start=1):
             if cancel and cancel():
                 con.execute("UPDATE metadata SET completed=false, total_rows_seen=?, valid_rows_stored=?", [totals.total_nonempty_rows, totals.valid_rows_stored])
@@ -377,7 +414,11 @@ def build_manifest(folder: Path, cache_dir: Path, filters: ImportFilters | None 
             counters.valid_rows_stored = int(after - before)
             counters.validate(path.name)
             totals.add(counters)
-            con.execute("INSERT OR REPLACE INTO imported_files VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [path.name, counters.total_nonempty_rows, counters.parsed_rows, counters.malformed_rows, counters.non_gps_rows, counters.low_elevation_rows, counters.out_of_bounds_rows, counters.valid_rows_stored, status, err])
+            st = path.stat()
+            sha = _file_sha256(path)
+            obs_digest = _normalized_observation_digest(con, path, filters)
+            file_sha_values.append(sha); file_obs_digests.append(obs_digest)
+            con.execute("INSERT OR REPLACE INTO imported_files (filename, total_nonempty_rows, parsed_rows, malformed_rows, non_gps_rows, low_elevation_rows, out_of_bounds_rows, valid_row_count, status, error_message, relative_filename, byte_size, mtime_ns, sha256, normalized_observation_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [path.name, counters.total_nonempty_rows, counters.parsed_rows, counters.malformed_rows, counters.non_gps_rows, counters.low_elevation_rows, counters.out_of_bounds_rows, counters.valid_rows_stored, status, err, path.name, int(st.st_size), int(st.st_mtime_ns), sha, obs_digest])
             con.execute("UPDATE metadata SET total_rows_seen=?, valid_rows_stored=?", [totals.total_nonempty_rows, totals.valid_rows_stored])
             rejected = totals.malformed_rows + totals.non_gps_rows + totals.low_elevation_rows + totals.out_of_bounds_rows
             _progress(progress, "reading_filtering", index, len(files), f"[4/7] Reading file {index} of {len(files)}: {path.name}. Stored {totals.valid_rows_stored:,} valid observations; rejected {totals.low_elevation_rows:,} below elevation; {rejected:,} total rejected.")
@@ -396,7 +437,10 @@ def build_manifest(folder: Path, cache_dir: Path, filters: ImportFilters | None 
         if totals.valid_rows_stored == 0:
             con.execute("UPDATE metadata SET completed=false, total_rows_seen=?, valid_rows_stored=0", [totals.total_nonempty_rows])
             raise RuntimeError(f"No valid observations passed the full import filters after reading all source rows. Parsed: {totals.parsed_rows}; malformed: {totals.malformed_rows}; GPS: {totals.gps_rows}; low elevation: {totals.low_elevation_rows}; out of bounds: {totals.out_of_bounds_rows}.")
-        con.execute("UPDATE metadata SET completed=true, total_rows_seen=?, valid_rows_stored=?", [totals.total_nonempty_rows, totals.valid_rows_stored])
+        source_digest = aggregate_digest(file_sha_values)
+        imported_digest = aggregate_digest(file_obs_digests)
+        fp = authoritative_fingerprint(_identity_payload(source_content_digest=source_digest, imported_observation_digest=imported_digest, filters=filters, year=year, doy=doy))
+        con.execute("UPDATE metadata SET completed=true, total_rows_seen=?, valid_rows_stored=?, source_content_digest=?, imported_observation_digest=?, authoritative_fingerprint=?", [totals.total_nonempty_rows, totals.valid_rows_stored, source_digest, imported_digest, fp])
     _progress(progress, "finalizing_cache", 1, 1, "[7/7] Finalizing cache")
     manifest = _manifest_from_cache(folder, cache_path, filters)
     manifest["parsed_row_count"] = totals.parsed_rows

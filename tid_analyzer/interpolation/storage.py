@@ -80,9 +80,10 @@ def grid_cache_namespace(grid_step_deg: float) -> str:
     step = validate_grid_step(grid_step_deg)
     return f"grid_{str(step).replace('.', 'p')}"
 
-def interpolation_cache_dir(cache_root: Path, year: int, doy: int, minimum_elevation_deg: float, grid_step_deg: float = DEFAULT_GRID_STEP_DEG) -> Path:
+def interpolation_cache_dir(cache_root: Path, year: int, doy: int, minimum_elevation_deg: float, grid_step_deg: float = DEFAULT_GRID_STEP_DEG, source_digest: str | None = None) -> Path:
     filters = ImportFilters(min_elevation_deg=minimum_elevation_deg)
-    return cache_path_for_day(cache_root, year, doy, filters).parent / "interpolation" / grid_cache_namespace(grid_step_deg)
+    base = cache_path_for_day(cache_root, year, doy, filters).parent / "interpolation" / grid_cache_namespace(grid_step_deg)
+    return base / f"source_{source_digest[:12]}" if source_digest else base
 
 
 def create_source_fingerprint(
@@ -101,15 +102,19 @@ def create_source_fingerprint(
     valid_observations = 0
     source_file_count = 0
     source_cache_version = CACHE_VERSION
+    strong: dict[str, Any] = {}
     if daily_cache_path.exists():
         with duckdb.connect(str(daily_cache_path), read_only=True) as con:
             valid_observations = int(con.execute("SELECT COUNT(*) FROM observations").fetchone()[0])
-            row = con.execute("SELECT source_file_count, application_cache_version FROM metadata LIMIT 1").fetchone()
+            row = con.execute("SELECT source_file_count, application_cache_version, source_content_digest, imported_observation_digest, authoritative_fingerprint, parser_version, import_filters_json FROM metadata LIMIT 1").fetchone()
+            strong = {}
             if row:
                 source_file_count = int(row[0] or 0)
                 source_cache_version = str(row[1] or CACHE_VERSION)
+                strong = {"source_content_digest": row[2], "imported_observation_digest": row[3], "authoritative_fingerprint": row[4], "parser_version": row[5], "import_filters_json": row[6]}
     return {
         "source_cache_version": source_cache_version,
+        **strong,
         "year": int(year),
         "doy": int(doy),
         "minimum_elevation_deg": float(minimum_elevation_deg),
@@ -142,10 +147,11 @@ def create_or_open_interpolation_cache(
     minimum_epoch_ipp_count: int = 30,
 ) -> Path:
     grid_step_deg = validate_grid_step(grid_step_deg)
-    cache_dir = interpolation_cache_dir(cache_root, year, doy, minimum_elevation_deg, grid_step_deg)
+    fingerprint = create_source_fingerprint(daily_cache_path=daily_cache_path or cache_path_for_day(cache_root, year, doy, ImportFilters(min_elevation_deg=minimum_elevation_deg)), year=year, doy=doy, minimum_elevation_deg=minimum_elevation_deg, grid_step_deg=grid_step_deg, longitude_bounds=longitude_bounds, latitude_bounds=latitude_bounds, projection=projection, interpolation_method=interpolation_method)
+    digest = str(fingerprint.get("source_content_digest") or fingerprint.get("authoritative_fingerprint") or "")
+    cache_dir = interpolation_cache_dir(cache_root, year, doy, minimum_elevation_deg, grid_step_deg, digest or None)
     cache_dir.mkdir(parents=True, exist_ok=True)
     daily_cache_path = daily_cache_path or cache_path_for_day(cache_root, year, doy, ImportFilters(min_elevation_deg=minimum_elevation_deg))
-    fingerprint = create_source_fingerprint(daily_cache_path=daily_cache_path, year=year, doy=doy, minimum_elevation_deg=minimum_elevation_deg, grid_step_deg=grid_step_deg, longitude_bounds=longitude_bounds, latitude_bounds=latitude_bounds, projection=projection, interpolation_method=interpolation_method)
     metadata_path = cache_dir / "metadata.json"
     now = _now()
     if metadata_path.exists():
@@ -180,6 +186,9 @@ def validate_interpolation_cache(cache_dir: Path, *, expected_fingerprint: dict[
     metadata = _read_metadata(metadata_path)
     if metadata.get("cache_format_version") != CACHE_FORMAT_VERSION:
         return _stale(cache_dir, metadata, "cache format version mismatch")
+    if not (metadata.get("source_cache_fingerprint") or {}).get("source_content_digest"):
+        metadata["verification_status"] = "legacy_unverified"
+        _write_metadata(metadata_path, metadata)
     if expected_fingerprint is not None and metadata.get("source_cache_fingerprint") != expected_fingerprint:
         return _stale(cache_dir, metadata, "source cache fingerprint mismatch")
     for key, value in expected.items():
