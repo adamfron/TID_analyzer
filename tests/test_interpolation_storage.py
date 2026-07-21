@@ -61,7 +61,7 @@ def _cache(tmp_path: Path, grid_step: float = 0.5) -> Path:
 
 def test_cache_folder_naming_by_year_doy_elevation(tmp_path: Path) -> None:
     cache_dir = _cache(tmp_path)
-    assert cache_dir == tmp_path / "cache" / "2024_246" / "elev_50" / "interpolation"
+    assert cache_dir == tmp_path / "cache" / "2024_246" / "elev_50" / "interpolation" / "grid_0p5"
 
 
 def test_metadata_is_created_correctly(tmp_path: Path) -> None:
@@ -139,7 +139,7 @@ def test_successful_epochs_survive_process_restart(tmp_path: Path) -> None:
     cache_dir = _cache(tmp_path)
     write_epoch_result(cache_dir, _result(), arc_index=1)
     del cache_dir
-    reopened = tmp_path / "cache" / "2024_246" / "elev_50" / "interpolation"
+    reopened = tmp_path / "cache" / "2024_246" / "elev_50" / "interpolation" / "grid_0p5"
     assert read_epoch_result(reopened, prn="G24", arc_index=1, epoch_index=0)["status"] == "ready"
 
 
@@ -159,3 +159,20 @@ def test_stale_cache_is_not_silently_reused(tmp_path: Path) -> None:
     invalidate_interpolation_cache(cache_dir, "test mismatch")
     with pytest.raises(RuntimeError, match="test mismatch"):
         read_epoch_result(cache_dir, prn="G24", arc_index=1, epoch_index=0)
+
+
+def test_resolution_cache_products_coexist_and_do_not_delete_half_degree(tmp_path: Path) -> None:
+    half = _cache(tmp_path, grid_step=0.5)
+    write_epoch_result(half, _result(), arc_index=1)
+    one = _cache(tmp_path, grid_step=1.0)
+    assert half.exists()
+    assert one.exists()
+    assert half != one
+    assert read_epoch_result(half, prn="G24", arc_index=1, epoch_index=0)["grid_step_deg"] == 0.5
+
+
+def test_incompatible_resolution_namespace_is_not_silently_reused(tmp_path: Path) -> None:
+    half = _cache(tmp_path, grid_step=0.5)
+    write_epoch_result(half, _result(), arc_index=1)
+    one = _cache(tmp_path, grid_step=1.0)
+    assert not (one / "G24_arc_1.zarr").exists()

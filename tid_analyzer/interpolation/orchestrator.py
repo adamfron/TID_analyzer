@@ -52,14 +52,14 @@ class InterpolationController:
         self.status = update
         await self.queue.put(update)
 
-    async def start_build(self, *, daily_cache_path: Path, retry_failed: bool = False, force_rebuild: bool = False, prn: str | None = None, arc_index: int | None = None, minimum_epoch_ipp_count: int = DEFAULT_MINIMUM_EPOCH_IPP_COUNT) -> dict[str, Any]:
+    async def start_build(self, *, daily_cache_path: Path, retry_failed: bool = False, force_rebuild: bool = False, prn: str | None = None, arc_index: int | None = None, minimum_epoch_ipp_count: int = DEFAULT_MINIMUM_EPOCH_IPP_COUNT, grid_step_deg: float = DEFAULT_GRID_STEP_DEG) -> dict[str, Any]:
         if self.task and not self.task.done():
             raise RuntimeError("An interpolation build is already running")
-        plan = build_interpolation_plan(cache_root=self.cache_dir, daily_cache_path=daily_cache_path, retry_failed=retry_failed, force_rebuild=force_rebuild, prn=prn, arc_index=arc_index, minimum_epoch_ipp_count=minimum_epoch_ipp_count)
+        plan = build_interpolation_plan(cache_root=self.cache_dir, daily_cache_path=daily_cache_path, retry_failed=retry_failed, force_rebuild=force_rebuild, prn=prn, arc_index=arc_index, minimum_epoch_ipp_count=minimum_epoch_ipp_count, grid_step_deg=grid_step_deg)
         self.cancel_event.clear()
         started_at_utc = datetime.now(timezone.utc)
         started_monotonic = time.monotonic()
-        self.task = asyncio.create_task(self._run_build(daily_cache_path=daily_cache_path, jobs=plan["jobs"], retry_failed=retry_failed, already_ready=int(plan["already_ready_count"]), low_coverage=int(plan.get("low_coverage_count", 0)), started_at_utc=started_at_utc, started_monotonic=started_monotonic))
+        self.task = asyncio.create_task(self._run_build(daily_cache_path=daily_cache_path, jobs=plan["jobs"], retry_failed=retry_failed, already_ready=int(plan["already_ready_count"]), low_coverage=int(plan.get("low_coverage_count", 0)), started_at_utc=started_at_utc, started_monotonic=started_monotonic, grid_step_deg=grid_step_deg))
         return {k: plan[k] for k in ("eligible_arc_count", "planned_epoch_count", "already_ready_count", "remaining_epoch_count")}
 
     async def cancel(self) -> None:
@@ -69,16 +69,16 @@ class InterpolationController:
         else:
             await self.publish({**_idle_status(), "state": "cancelled", "message": "No interpolation build is running"})
 
-    async def _run_build(self, *, daily_cache_path: Path, jobs: list[InterpolationJob], retry_failed: bool, already_ready: int = 0, low_coverage: int = 0, started_at_utc: datetime | None = None, started_monotonic: float | None = None) -> None:
+    async def _run_build(self, *, daily_cache_path: Path, jobs: list[InterpolationJob], retry_failed: bool, already_ready: int = 0, low_coverage: int = 0, started_at_utc: datetime | None = None, started_monotonic: float | None = None, grid_step_deg: float = DEFAULT_GRID_STEP_DEG) -> None:
         total = len(jobs)
         generated = skipped = failed = current = 0
         started_at_utc = started_at_utc or datetime.now(timezone.utc)
         started_monotonic = started_monotonic or time.monotonic()
-        cache_dir = _cache_dir_for_daily(self.cache_dir, daily_cache_path)
+        cache_dir = _cache_dir_for_daily(self.cache_dir, daily_cache_path, grid_step_deg)
         try:
-            await self.publish(_status("running", 0, total, generated, already_ready, skipped, failed, low_coverage, "Starting interpolation build", started_at_utc=started_at_utc, started_monotonic=started_monotonic))
+            await self.publish(_status("running", 0, total, generated, already_ready, skipped, failed, low_coverage, "Starting interpolation build", started_at_utc=started_at_utc, started_monotonic=started_monotonic, grid_step_deg=grid_step_deg))
             loop = asyncio.get_running_loop()
-            with ProcessPoolExecutor(max_workers=self.max_workers, initializer=_init_worker) as pool:
+            with ProcessPoolExecutor(max_workers=self.max_workers, initializer=_init_worker, initargs=(grid_step_deg,)) as pool:
                 pending: dict[Any, InterpolationJob] = {}
                 job_iter = _prepare_jobs_for_submission(daily_cache_path, jobs)
                 def submit_until_full() -> None:
@@ -96,7 +96,7 @@ class InterpolationController:
                     done, _ = await loop.run_in_executor(None, lambda: wait(pending, return_when=FIRST_COMPLETED))
                     for fut in done:
                         job = pending.pop(fut)
-                        await self.publish(_status("running", current, total, generated, already_ready, skipped, failed, low_coverage, f"Writing {job.prn} arc {job.arc_index} epoch {job.epoch_index}", job, started_at_utc=started_at_utc, started_monotonic=started_monotonic))
+                        await self.publish(_status("running", current, total, generated, already_ready, skipped, failed, low_coverage, f"Writing {job.prn} arc {job.arc_index} epoch {job.epoch_index}", job, started_at_utc=started_at_utc, started_monotonic=started_monotonic, grid_step_deg=grid_step_deg))
                         result, result_arc_index = fut.result()
                         write_epoch_result(cache_dir, result, arc_index=result_arc_index)
                         if result.status == "ready":
@@ -113,23 +113,24 @@ class InterpolationController:
             state = "cancelled" if self.cancel_event.is_set() else "completed"
             if state == "completed":
                 mark_cache_complete(cache_dir)
-            await self.publish(_status(state, current if state == "cancelled" else total, total, generated, already_ready, skipped, failed, low_coverage, "Interpolation build cancelled" if state == "cancelled" else "Interpolation build completed", started_at_utc=started_at_utc, started_monotonic=started_monotonic))
+            await self.publish(_status(state, current if state == "cancelled" else total, total, generated, already_ready, skipped, failed, low_coverage, "Interpolation build cancelled" if state == "cancelled" else "Interpolation build completed", started_at_utc=started_at_utc, started_monotonic=started_monotonic, grid_step_deg=grid_step_deg))
         except Exception as exc:  # noqa: BLE001
-            await self.publish(_status("error", current, total, generated, already_ready, skipped, failed, low_coverage, str(exc), started_at_utc=started_at_utc, started_monotonic=started_monotonic))
+            await self.publish(_status("error", current, total, generated, already_ready, skipped, failed, low_coverage, str(exc), started_at_utc=started_at_utc, started_monotonic=started_monotonic, grid_step_deg=grid_step_deg))
 
 
 def _idle_status() -> dict[str, Any]:
     return _status("idle", 0, 0, 0, 0, 0, 0, 0, "Idle")
 
 
-def _status(state: str, current: int, total: int, generated: int, already_ready: int, skipped: int, failed: int, low_coverage: int, message: str, job: InterpolationJob | None = None, *, started_at_utc: datetime | None = None, started_monotonic: float | None = None) -> dict[str, Any]:
+def _status(state: str, current: int, total: int, generated: int, already_ready: int, skipped: int, failed: int, low_coverage: int, message: str, job: InterpolationJob | None = None, *, started_at_utc: datetime | None = None, started_monotonic: float | None = None, grid_step_deg: float = DEFAULT_GRID_STEP_DEG) -> dict[str, Any]:
     pct = round((current / total) * 100, 2) if total else 0
     elapsed = (time.monotonic() - started_monotonic) if started_monotonic is not None else None
     completed = generated + skipped + failed
     mean = (elapsed / completed) if elapsed is not None and completed else None
     remaining = (mean * max(0, total - completed)) if mean is not None and completed >= 5 else None
     finish = (datetime.now(timezone.utc) + timedelta(seconds=remaining)).isoformat() if remaining is not None else None
-    return {"operation": "interpolation", "state": state, "current": current, "total": total, "percent": pct, "current_prn": job.prn if job else None, "current_arc_index": job.arc_index if job else None, "current_epoch_index": job.epoch_index if job else None, "generated": generated, "already_ready": already_ready, "skipped": skipped, "skipped_low_station_coverage": low_coverage, "failed": failed, "started_at_utc": started_at_utc.isoformat() if started_at_utc else None, "elapsed_seconds": elapsed, "completed_element_count": completed, "mean_seconds_per_element": mean, "remaining_seconds": remaining, "estimated_finish_utc": finish, "message": message}
+    geom = prepare_grid_geometry(grid_step_deg)
+    return {"operation": "interpolation", "state": state, "grid_step_deg": float(grid_step_deg), "grid_lat_count": int(len(geom.lat_values)), "grid_lon_count": int(len(geom.lon_values)), "current": current, "total": total, "percent": pct, "current_prn": job.prn if job else None, "current_arc_index": job.arc_index if job else None, "current_epoch_index": job.epoch_index if job else None, "generated": generated, "already_ready": already_ready, "skipped": skipped, "skipped_low_station_coverage": low_coverage, "failed": failed, "started_at_utc": started_at_utc.isoformat() if started_at_utc else None, "elapsed_seconds": elapsed, "completed_element_count": completed, "mean_seconds_per_element": mean, "remaining_seconds": remaining, "estimated_finish_utc": finish, "message": message}
 
 
 def _max_workers() -> int:
@@ -150,9 +151,9 @@ def _daily_metadata(daily_cache_path: Path) -> tuple[int, int, float]:
     return int(row[0]), int(row[1]), float(row[2])
 
 
-def _cache_dir_for_daily(cache_root: Path, daily_cache_path: Path) -> Path:
+def _cache_dir_for_daily(cache_root: Path, daily_cache_path: Path, grid_step_deg: float = DEFAULT_GRID_STEP_DEG) -> Path:
     y, d, elev = _daily_metadata(daily_cache_path)
-    return interpolation_cache_dir(cache_root, y, d, elev)
+    return interpolation_cache_dir(cache_root, y, d, elev, grid_step_deg)
 
 
 def eligible_arcs_from_daily(daily_cache_path: Path, gap_minutes: float = 10.0, min_stations: int = 100, min_duration_min: float = 120.0, minimum_epoch_ipp_count: int = 100) -> list[dict[str, Any]]:
@@ -191,17 +192,17 @@ def _has_three_unique_non_collinear_ipps(points: list[tuple[float, float]]) -> b
                 return True
     return False
 
-def build_interpolation_plan(*, cache_root: Path, daily_cache_path: Path, retry_failed: bool = False, force_rebuild: bool = False, prn: str | None = None, arc_index: int | None = None, minimum_epoch_ipp_count: int = 100) -> dict[str, Any]:
+def build_interpolation_plan(*, cache_root: Path, daily_cache_path: Path, retry_failed: bool = False, force_rebuild: bool = False, prn: str | None = None, arc_index: int | None = None, minimum_epoch_ipp_count: int = 100, grid_step_deg: float = DEFAULT_GRID_STEP_DEG) -> dict[str, Any]:
     year, doy, elev = _daily_metadata(daily_cache_path)
     arcs = eligible_arcs_from_daily(daily_cache_path, minimum_epoch_ipp_count=minimum_epoch_ipp_count)
     eligible = [a for a in arcs if a.get("eligible_for_interpolation") is True]
     if prn is not None:
         eligible = [a for a in eligible if str(a.get("prn")) == prn and (arc_index is None or int(a.get("arc_index", -1)) == arc_index)]
     descriptors = [ArcDescriptor(str(a["prn"]), int(a["arc_index"]), int(a.get("usable_epoch_count", a["epoch_count"]))) for a in eligible]
-    cache_dir = interpolation_cache_dir(cache_root, year, doy, elev)
+    cache_dir = interpolation_cache_dir(cache_root, year, doy, elev, grid_step_deg)
     if force_rebuild and cache_dir.exists():
         shutil.rmtree(cache_dir)
-    cache_dir = create_or_open_interpolation_cache(cache_root=cache_root, daily_cache_path=daily_cache_path, year=year, doy=doy, minimum_elevation_deg=elev, arcs=descriptors, minimum_epoch_ipp_count=minimum_epoch_ipp_count)
+    cache_dir = create_or_open_interpolation_cache(cache_root=cache_root, daily_cache_path=daily_cache_path, year=year, doy=doy, minimum_elevation_deg=elev, arcs=descriptors, minimum_epoch_ipp_count=minimum_epoch_ipp_count, grid_step_deg=grid_step_deg)
     jobs_by_key: dict[tuple[str, int, int], InterpolationJob] = {}
     already_ready = skipped_existing = low_coverage_count = 0
     with connect_cache(daily_cache_path) as con:
@@ -244,9 +245,9 @@ def _compute_job(daily_cache_path: Path, job: InterpolationJob):
 _WORKER_GEOMETRY: GridGeometry | None = None
 
 
-def _init_worker() -> None:
+def _init_worker(grid_step_deg: float = DEFAULT_GRID_STEP_DEG) -> None:
     global _WORKER_GEOMETRY
-    _WORKER_GEOMETRY = prepare_grid_geometry(DEFAULT_GRID_STEP_DEG)
+    _WORKER_GEOMETRY = prepare_grid_geometry(grid_step_deg)
 
 
 def _prepare_jobs_for_submission(daily_cache_path: Path, jobs: list[InterpolationJob], *, chunk_epochs: int = 64):

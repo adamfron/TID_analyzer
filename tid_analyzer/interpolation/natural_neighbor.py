@@ -26,8 +26,36 @@ PROJECTION = "EPSG:3035"
 SOURCE_CRS = "EPSG:4326"
 LON_BOUNDS = (-20.0, 50.0)
 LAT_BOUNDS = (20.0, 80.0)
-DEFAULT_GRID_STEP_DEG = 0.5
+DEFAULT_GRID_STEP_DEG = 1.0
+SUPPORTED_GRID_STEPS_DEG = (0.5, 1.0)
 STAGE_NAMES = ("database_query", "input_cleaning", "coordinate_projection", "duplicate_grouping", "triangulation_and_interpolation", "result_serialization", "zarr_write", "total_epoch_time")
+
+
+def validate_grid_step(grid_step_deg: float) -> float:
+    step = float(grid_step_deg)
+    if step not in SUPPORTED_GRID_STEPS_DEG:
+        raise ValueError("grid_step_deg must be one of 0.5 or 1.0")
+    return step
+
+def cell_area_sq_deg(grid_step_deg: float) -> float:
+    step = validate_grid_step(grid_step_deg)
+    return step * step
+
+def approximate_cell_area_km2(latitude_deg: float, grid_step_deg: float) -> float:
+    step = validate_grid_step(grid_step_deg)
+    km_per_lat_deg = 111.32
+    km_per_lon_deg = km_per_lat_deg * np.cos(np.deg2rad(float(latitude_deg)))
+    return abs(step * km_per_lat_deg * step * km_per_lon_deg)
+
+def cells_for_min_object_area(area_km2: float, latitude_deg: float, grid_step_deg: float) -> int:
+    """Convert an area-based future TID object threshold to grid cells.
+
+    Historical conceptual guidance of 25-50 cells on the 0.5° grid maps to
+    roughly 6-13 cells on the 1.0° grid, but future detection settings should
+    prefer physical area thresholds over fixed pixel counts.
+    """
+    cell_area = approximate_cell_area_km2(latitude_deg, grid_step_deg)
+    return int(np.ceil(float(area_km2) / cell_area)) if cell_area > 0 else 0
 
 
 @dataclass(frozen=True)
@@ -65,6 +93,7 @@ class NaturalNeighborResult:
 
 
 def prepare_grid_geometry(grid_step_deg: float = DEFAULT_GRID_STEP_DEG, *, source_crs: str = SOURCE_CRS, target_crs: str = PROJECTION) -> GridGeometry:
+    grid_step_deg = validate_grid_step(grid_step_deg)
     lon_values, lat_values, grid_lon, grid_lat = _target_grid(grid_step_deg)
     if Transformer is None:
         projected_grid_x = np.full(grid_lon.shape, np.nan, dtype=float)
@@ -138,7 +167,7 @@ def _result(prn, epoch_index, time_h, geometry, values, valid_mask, point_count,
 
 
 def _target_grid(grid_step_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    if grid_step_deg <= 0: raise ValueError("grid_step_deg must be positive")
+    grid_step_deg = validate_grid_step(grid_step_deg)
     lon_values = np.arange(LON_BOUNDS[0], LON_BOUNDS[1] + grid_step_deg / 2.0, grid_step_deg)
     lat_values = np.arange(LAT_BOUNDS[0], LAT_BOUNDS[1] + grid_step_deg / 2.0, grid_step_deg)
     grid_lon, grid_lat = np.meshgrid(lon_values, lat_values)

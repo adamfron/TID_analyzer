@@ -75,11 +75,11 @@ def test_successful_result_has_expected_metadata_dimensions_and_finite_supported
     assert result.status == "ready"
     assert result.method == METHOD
     assert result.projection == PROJECTION
-    assert result.grid_step_deg == 0.5
-    assert result.lon_values.shape == (141,)
-    assert result.lat_values.shape == (121,)
-    assert result.values.shape == (121, 141)
-    assert result.valid_mask.shape == (121, 141)
+    assert result.grid_step_deg == 1.0
+    assert result.lon_values.shape == (71,)
+    assert result.lat_values.shape == (61,)
+    assert result.values.shape == (61, 71)
+    assert result.valid_mask.shape == (61, 71)
     assert np.isfinite(result.values[result.valid_mask]).any()
 
 
@@ -195,3 +195,9 @@ def test_rows_input_is_supported():
 
     assert result.status == "ready"
     assert result.point_count == 3
+
+
+def test_optional_half_degree_grid_dimensions_remain_available():
+    result = interpolate_prn_epoch_natural_neighbor(**{**_base_kwargs(), "grid_step_deg": 0.5})
+    assert result.grid_step_deg == 0.5
+    assert result.values.shape == (121, 141)

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 try:
     import pywt
 except ImportError:  # pragma: no cover - dependency is declared for runtime installs.
@@ -20,7 +20,7 @@ from tid_analyzer.config import DEFAULT_MINIMUM_EPOCH_IPP_COUNT, ImportFilters
 from tid_analyzer.api.state import ImportState
 from tid_analyzer.interpolation.orchestrator import InterpolationController, eligible_arcs_from_daily, get_epoch_status
 from tid_analyzer.interpolation.storage import read_epoch_result, validate_interpolation_cache
-from tid_analyzer.interpolation.natural_neighbor import METHOD, PROJECTION, DEFAULT_GRID_STEP_DEG
+from tid_analyzer.interpolation.natural_neighbor import METHOD, PROJECTION, DEFAULT_GRID_STEP_DEG, prepare_grid_geometry, validate_grid_step
 from tid_analyzer.importer.cache import connect_cache
 from tid_analyzer.importer.parser import StationRow, build_manifest, iter_station_files, iter_valid_rows
 from tid_analyzer.solar import solar_geometry_from_manifest
@@ -40,6 +40,12 @@ class InterpolationBuildRequest(BaseModel):
     retry_failed: bool = False
     force_rebuild: bool = False
     minimum_epoch_ipp_count: int = DEFAULT_MINIMUM_EPOCH_IPP_COUNT
+    grid_step_deg: float = DEFAULT_GRID_STEP_DEG
+
+    @field_validator("grid_step_deg")
+    @classmethod
+    def _valid_grid_step(cls, value: float) -> float:
+        return validate_grid_step(value)
 
 
 class InterpolationBuildArcRequest(InterpolationBuildRequest):
@@ -55,6 +61,13 @@ class SpectralRequest(BaseModel):
     period_min_min: float = 2
     period_min_max: float = 180
 
+
+
+def _validated_grid_step_or_422(grid_step_deg: float) -> float:
+    try:
+        return validate_grid_step(grid_step_deg)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 def _require_source_folder() -> Path:
     if state.source_folder is None:
@@ -292,7 +305,7 @@ def _catalog_station_markers(cache_path: Path, station_codes: list[str] | None) 
 def _attach_interpolation_arc_status(cache_path: Path, arcs: list[dict[str, object]]) -> list[dict[str, object]]:
     try:
         from tid_analyzer.interpolation.orchestrator import _cache_dir_for_daily
-        cache_dir = _cache_dir_for_daily(state.cache_dir, cache_path)
+        cache_dir = _cache_dir_for_daily(state.cache_dir, cache_path, DEFAULT_GRID_STEP_DEG)
         metadata = validate_interpolation_cache(cache_dir).metadata or {}
         entries = {(e["prn"], int(e["arc_index"])): e for e in metadata.get("arc_entries", [])}
     except Exception:
@@ -470,7 +483,7 @@ async def spectral_morlet(request: SpectralRequest) -> dict[str, object]:
 async def interpolation_build_all(request: InterpolationBuildRequest) -> dict[str, object]:
     cache_path = _require_cache_path()
     try:
-        response = await interpolation_state.start_build(daily_cache_path=cache_path, retry_failed=request.retry_failed, force_rebuild=request.force_rebuild, minimum_epoch_ipp_count=request.minimum_epoch_ipp_count)
+        response = await interpolation_state.start_build(daily_cache_path=cache_path, retry_failed=request.retry_failed, force_rebuild=request.force_rebuild, minimum_epoch_ipp_count=request.minimum_epoch_ipp_count, grid_step_deg=request.grid_step_deg)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"message": "Interpolation build started", **response}
@@ -480,7 +493,7 @@ async def interpolation_build_all(request: InterpolationBuildRequest) -> dict[st
 async def interpolation_build_arc(request: InterpolationBuildArcRequest) -> dict[str, object]:
     cache_path = _require_cache_path()
     try:
-        response = await interpolation_state.start_build(daily_cache_path=cache_path, retry_failed=request.retry_failed, force_rebuild=request.force_rebuild, prn=request.prn, arc_index=request.arc_index, minimum_epoch_ipp_count=request.minimum_epoch_ipp_count)
+        response = await interpolation_state.start_build(daily_cache_path=cache_path, retry_failed=request.retry_failed, force_rebuild=request.force_rebuild, prn=request.prn, arc_index=request.arc_index, minimum_epoch_ipp_count=request.minimum_epoch_ipp_count, grid_step_deg=request.grid_step_deg)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"message": "Arc interpolation build started", **response}
@@ -498,13 +511,14 @@ async def interpolation_status() -> dict[str, object]:
 
 
 @app.get("/api/interpolation/summary")
-async def interpolation_summary(minimum_epoch_ipp_count: int = Query(DEFAULT_MINIMUM_EPOCH_IPP_COUNT, ge=3, le=200)) -> dict[str, object]:
+async def interpolation_summary(minimum_epoch_ipp_count: int = Query(DEFAULT_MINIMUM_EPOCH_IPP_COUNT, ge=3, le=200), grid_step_deg: float = Query(DEFAULT_GRID_STEP_DEG)) -> dict[str, object]:
+    grid_step_deg = _validated_grid_step_or_422(grid_step_deg)
     cache_path = _require_cache_path()
     arcs = eligible_arcs_from_daily(cache_path, minimum_epoch_ipp_count=minimum_epoch_ipp_count)
     eligible = [a for a in arcs if a.get("eligible_for_interpolation")]
     try:
         from tid_analyzer.interpolation.orchestrator import _cache_dir_for_daily
-        cache_dir = _cache_dir_for_daily(state.cache_dir, cache_path)
+        cache_dir = _cache_dir_for_daily(state.cache_dir, cache_path, grid_step_deg)
         validation = validate_interpolation_cache(cache_dir)
         metadata = validation.metadata or {}
     except Exception:
@@ -517,23 +531,25 @@ async def interpolation_summary(minimum_epoch_ipp_count: int = Query(DEFAULT_MIN
         st = "not_generated" if r==0 and f==0 else ("ready" if r>=exp and f==0 else ("failed" if r==0 and f>0 else "partial"))
         per_arc.append({"prn": arc["prn"], "arc_index": arc["arc_index"], "expected": exp, "ready": r, "failed": f, "status": st, "raw_epoch_count": arc.get("raw_epoch_count", arc["epoch_count"]), "planned_interpolation_count": exp, "low_point_epoch_count": arc.get("low_point_epoch_count", 0)})
     planned=sum(int(a.get("usable_epoch_count", a["epoch_count"])) for a in eligible)
-    return {"eligible_arc_count": len(eligible), "ineligible_arc_count": len(arcs)-len(eligible), "planned_map_count": planned, "ready_map_count": ready, "missing_map_count": max(0, planned-ready-failed), "failed_map_count": failed, "cache_compatible": bool(validation and validation.compatible), "cache_completed": bool(metadata.get("completed", False)), "method": metadata.get("interpolation_method", METHOD), "projection": metadata.get("projection", PROJECTION), "grid_step_deg": float(metadata.get("grid_step_deg", DEFAULT_GRID_STEP_DEG)), "minimum_epoch_ipp_count": minimum_epoch_ipp_count, "arcs": per_arc}
+    geom = prepare_grid_geometry(grid_step_deg)
+    return {"eligible_arc_count": len(eligible), "ineligible_arc_count": len(arcs)-len(eligible), "planned_map_count": planned, "ready_map_count": ready, "missing_map_count": max(0, planned-ready-failed), "failed_map_count": failed, "cache_compatible": bool(validation and validation.compatible), "cache_completed": bool(metadata.get("completed", False)), "method": metadata.get("interpolation_method", METHOD), "projection": metadata.get("projection", PROJECTION), "grid_step_deg": float(grid_step_deg), "grid_lat_count": int(len(geom.lat_values)), "grid_lon_count": int(len(geom.lon_values)), "grid_cell_count": int(len(geom.lat_values)*len(geom.lon_values)), "minimum_epoch_ipp_count": minimum_epoch_ipp_count, "arcs": per_arc}
 
 
 @app.get("/api/interpolation/epoch")
-async def interpolation_epoch(prn: str = Query(...), time_h: float = Query(...)) -> dict[str, object]:
+async def interpolation_epoch(prn: str = Query(...), time_h: float = Query(...), grid_step_deg: float = Query(DEFAULT_GRID_STEP_DEG)) -> dict[str, object]:
     cache_path = _require_cache_path()
     with connect_cache(cache_path) as con:
         row = con.execute("SELECT epoch_index, time_h FROM prn_epochs WHERE prn = ? ORDER BY ABS(epoch_index - ROUND(? * 120)), time_h LIMIT 1", [prn, time_h]).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail=f"No cached epochs are available for PRN {prn}.")
     epoch_index, actual_time_h = int(row[0]), float(row[1])
+    grid_step_deg = _validated_grid_step_or_422(grid_step_deg)
     arcs = [a for a in eligible_arcs_from_daily(cache_path) if str(a["prn"]) == prn and int(round(float(a["start_time_h"])*120)) <= epoch_index <= int(round(float(a["end_time_h"])*120))]
     if not arcs:
         raise HTTPException(status_code=404, detail=f"No interpolation arc contains PRN {prn} epoch {epoch_index}.")
     arc = arcs[0]
     from tid_analyzer.interpolation.orchestrator import _cache_dir_for_daily
-    cache_dir = _cache_dir_for_daily(state.cache_dir, cache_path)
+    cache_dir = _cache_dir_for_daily(state.cache_dir, cache_path, grid_step_deg)
     status = get_epoch_status(cache_dir, prn=prn, arc_index=int(arc["arc_index"]), epoch_index=epoch_index)
     if status is None:
         raise HTTPException(status_code=404, detail=f"No interpolation grid is cached for PRN {prn} epoch {epoch_index}.")
