@@ -134,6 +134,7 @@ def create_or_open_interpolation_cache(
     interpolation_method: str = METHOD,
     minimum_arc_station_count: int = 3,
     minimum_arc_duration_min: float = 0.0,
+    minimum_epoch_ipp_count: int = 30,
 ) -> Path:
     cache_dir = interpolation_cache_dir(cache_root, year, doy, minimum_elevation_deg)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -152,7 +153,7 @@ def create_or_open_interpolation_cache(
             "year": int(year), "doy": int(doy), "minimum_elevation_deg": float(minimum_elevation_deg),
             "longitude_bounds": list(map(float, longitude_bounds)), "latitude_bounds": list(map(float, latitude_bounds)),
             "grid_step_deg": float(grid_step_deg), "projection": projection, "interpolation_method": interpolation_method,
-            "minimum_arc_station_count": int(minimum_arc_station_count), "minimum_arc_duration_min": float(minimum_arc_duration_min),
+            "minimum_arc_station_count": int(minimum_arc_station_count), "minimum_arc_duration_min": float(minimum_arc_duration_min), "minimum_epoch_ipp_count": int(minimum_epoch_ipp_count),
             "created_at": now, "updated_at": now, "completed": False, "stale": False, "stale_reason": "", "arc_entries": [],
         }
     existing = {(e["prn"], int(e["arc_index"])): e for e in metadata.get("arc_entries", [])}
@@ -160,6 +161,7 @@ def create_or_open_interpolation_cache(
         item = arc if isinstance(arc, dict) else arc.__dict__
         prn, arc_index = str(item["prn"]), int(item["arc_index"])
         existing.setdefault((prn, arc_index), {"prn": prn, "arc_index": arc_index, "expected_epoch_count": int(item["expected_epoch_count"]), "stored_epoch_count": 0, "failed_epoch_count": 0, "status": "pending", "store_path": f"{prn}_arc_{arc_index}.zarr"})
+    metadata["minimum_epoch_ipp_count"] = int(minimum_epoch_ipp_count)
     metadata["arc_entries"] = sorted(existing.values(), key=lambda e: (e["prn"], int(e["arc_index"])))
     _write_metadata(metadata_path, metadata)
     return cache_dir

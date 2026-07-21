@@ -19,7 +19,7 @@ assert.match(src, /<g className="ticks">/, 'coordinate ticks and labels are alwa
 assert.match(src, /<rect className="mapFrame"/, 'outer map frame is always rendered');
 assert.match(src, /function mapGridValues\(min:number,max:number\)[\s\S]*v\+=10/, 'grid uses applicable 10-degree lines in viewport');
 assert.match(src, /plotW=690[\s\S]*cbX=790/, 'plotting rectangle is narrowed with separate right-side colorbar region');
-assert.match(src, /<Colorbar x=\{cbX\} y=\{padT\} height=\{plotH\}\/>/, 'colorbar height matches plotting rectangle');
+assert.match(src, /<Colorbar x=\{cbX\} y=\{padT\} height=\{plotH\} range=\{display\.dtecRange\}\/>/, 'colorbar height matches plotting rectangle');
 assert.match(src, /data-lon-min=\{v\.lon_min\}[\s\S]*<metadata>\{`viewport lon_min=/, 'exportable SVG includes viewport extent metadata');
 assert.match(css, /\.plot[\s\S]*width:\s*100%/, 'map scales with available sidebar-expanded/collapsed space');
 assert.match(css, /\.workspace\.sidebarCollapsed\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\) 0;/, 'sidebar collapse gives map the full column');

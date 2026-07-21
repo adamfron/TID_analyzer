@@ -16,7 +16,7 @@ try:
 except ImportError:  # pragma: no cover - dependency is declared for runtime installs.
     pywt = None
 
-from tid_analyzer.config import ImportFilters
+from tid_analyzer.config import DEFAULT_MINIMUM_EPOCH_IPP_COUNT, ImportFilters
 from tid_analyzer.api.state import ImportState
 from tid_analyzer.interpolation.orchestrator import InterpolationController, eligible_arcs_from_daily, get_epoch_status
 from tid_analyzer.interpolation.storage import read_epoch_result, validate_interpolation_cache
@@ -39,6 +39,7 @@ class ImportRequest(BaseModel):
 class InterpolationBuildRequest(BaseModel):
     retry_failed: bool = False
     force_rebuild: bool = False
+    minimum_epoch_ipp_count: int = DEFAULT_MINIMUM_EPOCH_IPP_COUNT
 
 
 class InterpolationBuildArcRequest(InterpolationBuildRequest):
@@ -236,7 +237,7 @@ async def preview_points(
 
 
 @app.get("/api/satellites/visibility")
-async def satellite_visibility(gap_minutes: float = Query(10, gt=0)) -> dict[str, object]:
+async def satellite_visibility(gap_minutes: float = Query(10, gt=0), minimum_epoch_ipp_count: int = Query(DEFAULT_MINIMUM_EPOCH_IPP_COUNT, ge=3, le=200)) -> dict[str, object]:
     cache_path = _require_cache_path()
     gap_epochs = gap_minutes * 60 / 30
     arcs: list[dict[str, object]] = []
@@ -257,14 +258,14 @@ async def satellite_visibility(gap_minutes: float = Query(10, gt=0)) -> dict[str
         starts_new_prn = previous_prn is not None and prn != previous_prn
         gap_split = previous_epoch is not None and epoch_index - previous_epoch > gap_epochs
         if current and (starts_new_prn or gap_split):
-            arcs.append(_visibility_arc_from_epochs(current[0][0], arc_index, current))
+            arcs.append(_visibility_arc_from_epochs(current[0][0], arc_index, current, minimum_epoch_ipp_count))
             arc_index = 1 if starts_new_prn else arc_index + 1
             current = []
         current.append((prn, epoch_index, float(time_h), int(row_count), int(station_count), tuple(str(s) for s in (stations or []))))
         previous_prn = prn
         previous_epoch = epoch_index
     if current:
-        arcs.append(_visibility_arc_from_epochs(current[0][0], arc_index, current))
+        arcs.append(_visibility_arc_from_epochs(current[0][0], arc_index, current, minimum_epoch_ipp_count))
     return {"arcs": _attach_interpolation_arc_status(cache_path, arcs)}
 
 
@@ -310,12 +311,12 @@ def _attach_interpolation_arc_status(cache_path: Path, arcs: list[dict[str, obje
     return out
 
 
-def _visibility_arc_from_epochs(prn: str, arc_index: int, rows: list[tuple[str, int, float, int, int, tuple[str, ...]]]) -> dict[str, object]:
+def _visibility_arc_from_epochs(prn: str, arc_index: int, rows: list[tuple[str, int, float, int, int, tuple[str, ...]]], minimum_epoch_ipp_count: int = DEFAULT_MINIMUM_EPOCH_IPP_COUNT) -> dict[str, object]:
     start = rows[0][2]
     end = rows[-1][2]
     duration_min = (end - start) * 60
     per_epoch_station_counts = [int(r[4]) for r in rows]
-    usable_rows = [r for r in rows if int(r[4]) >= 100]
+    usable_rows = [r for r in rows if int(r[3]) >= minimum_epoch_ipp_count]
     low_coverage_epoch_count = len(rows) - len(usable_rows)
     unique_stations = {station for row in rows for station in row[5]}
     station_count = len(unique_stations)
@@ -335,10 +336,15 @@ def _visibility_arc_from_epochs(prn: str, arc_index: int, rows: list[tuple[str, 
         "epoch_count": len(rows),
         "total_epoch_count": len(rows),
         "usable_epoch_count": len(usable_rows),
+        "raw_epoch_count": len(rows),
+        "planned_interpolation_count": len(usable_rows),
+        "low_point_epoch_count": low_coverage_epoch_count,
+        "ready_map_count": 0,
+        "minimum_epoch_ipp_count": int(minimum_epoch_ipp_count),
         "low_coverage_epoch_count": low_coverage_epoch_count,
         "first_usable_time_h": usable_rows[0][2] if usable_rows else None,
         "last_usable_time_h": usable_rows[-1][2] if usable_rows else None,
-        "no_usable_epoch_reason": "No epoch has at least 100 unique contributing stations; no interpolated map is planned." if not usable_rows else None,
+        "no_usable_epoch_reason": "No epoch meets the minimum IPP threshold; no interpolated map is planned." if not usable_rows else None,
         "max_station_count": max(per_epoch_station_counts),
         "median_station_count": float(median(per_epoch_station_counts)),
         "eligible_for_interpolation": not reasons,
@@ -464,7 +470,7 @@ async def spectral_morlet(request: SpectralRequest) -> dict[str, object]:
 async def interpolation_build_all(request: InterpolationBuildRequest) -> dict[str, object]:
     cache_path = _require_cache_path()
     try:
-        response = await interpolation_state.start_build(daily_cache_path=cache_path, retry_failed=request.retry_failed, force_rebuild=request.force_rebuild)
+        response = await interpolation_state.start_build(daily_cache_path=cache_path, retry_failed=request.retry_failed, force_rebuild=request.force_rebuild, minimum_epoch_ipp_count=request.minimum_epoch_ipp_count)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"message": "Interpolation build started", **response}
@@ -474,7 +480,7 @@ async def interpolation_build_all(request: InterpolationBuildRequest) -> dict[st
 async def interpolation_build_arc(request: InterpolationBuildArcRequest) -> dict[str, object]:
     cache_path = _require_cache_path()
     try:
-        response = await interpolation_state.start_build(daily_cache_path=cache_path, retry_failed=request.retry_failed, force_rebuild=request.force_rebuild, prn=request.prn, arc_index=request.arc_index)
+        response = await interpolation_state.start_build(daily_cache_path=cache_path, retry_failed=request.retry_failed, force_rebuild=request.force_rebuild, prn=request.prn, arc_index=request.arc_index, minimum_epoch_ipp_count=request.minimum_epoch_ipp_count)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"message": "Arc interpolation build started", **response}
@@ -492,9 +498,9 @@ async def interpolation_status() -> dict[str, object]:
 
 
 @app.get("/api/interpolation/summary")
-async def interpolation_summary() -> dict[str, object]:
+async def interpolation_summary(minimum_epoch_ipp_count: int = Query(DEFAULT_MINIMUM_EPOCH_IPP_COUNT, ge=3, le=200)) -> dict[str, object]:
     cache_path = _require_cache_path()
-    arcs = eligible_arcs_from_daily(cache_path)
+    arcs = eligible_arcs_from_daily(cache_path, minimum_epoch_ipp_count=minimum_epoch_ipp_count)
     eligible = [a for a in arcs if a.get("eligible_for_interpolation")]
     try:
         from tid_analyzer.interpolation.orchestrator import _cache_dir_for_daily
@@ -509,9 +515,9 @@ async def interpolation_summary() -> dict[str, object]:
         e = entries.get((str(arc["prn"]), int(arc["arc_index"])), {})
         r=int(e.get("stored_epoch_count",0)); f=int(e.get("failed_epoch_count",0)); exp=int(arc.get("usable_epoch_count", arc["epoch_count"])); ready+=r; failed+=f
         st = "not_generated" if r==0 and f==0 else ("ready" if r>=exp and f==0 else ("failed" if r==0 and f>0 else "partial"))
-        per_arc.append({"prn": arc["prn"], "arc_index": arc["arc_index"], "expected": exp, "ready": r, "failed": f, "status": st})
+        per_arc.append({"prn": arc["prn"], "arc_index": arc["arc_index"], "expected": exp, "ready": r, "failed": f, "status": st, "raw_epoch_count": arc.get("raw_epoch_count", arc["epoch_count"]), "planned_interpolation_count": exp, "low_point_epoch_count": arc.get("low_point_epoch_count", 0)})
     planned=sum(int(a.get("usable_epoch_count", a["epoch_count"])) for a in eligible)
-    return {"eligible_arc_count": len(eligible), "ineligible_arc_count": len(arcs)-len(eligible), "planned_map_count": planned, "ready_map_count": ready, "missing_map_count": max(0, planned-ready-failed), "failed_map_count": failed, "cache_compatible": bool(validation and validation.compatible), "cache_completed": bool(metadata.get("completed", False)), "method": metadata.get("interpolation_method", METHOD), "projection": metadata.get("projection", PROJECTION), "grid_step_deg": float(metadata.get("grid_step_deg", DEFAULT_GRID_STEP_DEG)), "arcs": per_arc}
+    return {"eligible_arc_count": len(eligible), "ineligible_arc_count": len(arcs)-len(eligible), "planned_map_count": planned, "ready_map_count": ready, "missing_map_count": max(0, planned-ready-failed), "failed_map_count": failed, "cache_compatible": bool(validation and validation.compatible), "cache_completed": bool(metadata.get("completed", False)), "method": metadata.get("interpolation_method", METHOD), "projection": metadata.get("projection", PROJECTION), "grid_step_deg": float(metadata.get("grid_step_deg", DEFAULT_GRID_STEP_DEG)), "minimum_epoch_ipp_count": minimum_epoch_ipp_count, "arcs": per_arc}
 
 
 @app.get("/api/interpolation/epoch")
