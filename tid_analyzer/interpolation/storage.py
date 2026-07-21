@@ -33,6 +33,10 @@ from tid_analyzer.interpolation.natural_neighbor import (
 CACHE_FORMAT_VERSION = "interpolation_zarr_v1"
 ELIGIBILITY_RULE_VERSION = "visibility_arc_rules_v1"
 VALID_EPOCH_STATUSES = {"pending", "ready", "insufficient_points", "geometry_error", "failed"}
+PRODUCT_TYPE_PER_PRN = "per_prn"
+PRODUCT_TYPE_COMBINED_GPS = "combined_gps"
+COMBINED_GPS_PRODUCT_ID = "GPS_ALL"
+COMBINED_GPS_WARNING = "Experimental combined field. The map combines dTEC observations from multiple station-satellite links without additional cross-link normalization. Inspect individual-PRN maps when interpreting discontinuities or offsets."
 
 
 @dataclass(frozen=True)
@@ -166,13 +170,15 @@ def create_or_open_interpolation_cache(
             "longitude_bounds": list(map(float, longitude_bounds)), "latitude_bounds": list(map(float, latitude_bounds)),
             "grid_step_deg": float(grid_step_deg), "projection": projection, "interpolation_method": interpolation_method,
             "minimum_arc_station_count": int(minimum_arc_station_count), "minimum_arc_duration_min": float(minimum_arc_duration_min), "minimum_epoch_ipp_count": int(minimum_epoch_ipp_count),
-            "created_at": now, "updated_at": now, "completed": False, "stale": False, "stale_reason": "", "arc_entries": [],
+            "product_types": [PRODUCT_TYPE_PER_PRN], "created_at": now, "updated_at": now, "completed": False, "stale": False, "stale_reason": "", "arc_entries": [], "product_entries": [],
         }
+    metadata.setdefault("product_types", [PRODUCT_TYPE_PER_PRN])
+    metadata.setdefault("product_entries", [])
     existing = {(e["prn"], int(e["arc_index"])): e for e in metadata.get("arc_entries", [])}
     for arc in arcs:
         item = arc if isinstance(arc, dict) else arc.__dict__
         prn, arc_index = str(item["prn"]), int(item["arc_index"])
-        existing.setdefault((prn, arc_index), {"prn": prn, "arc_index": arc_index, "expected_epoch_count": int(item["expected_epoch_count"]), "stored_epoch_count": 0, "failed_epoch_count": 0, "status": "pending", "store_path": f"{prn}_arc_{arc_index}.zarr"})
+        existing.setdefault((prn, arc_index), {"product_type": PRODUCT_TYPE_PER_PRN, "product_id": prn, "prn": prn, "arc_index": arc_index, "expected_epoch_count": int(item["expected_epoch_count"]), "stored_epoch_count": 0, "failed_epoch_count": 0, "status": "pending", "store_path": f"{prn}_arc_{arc_index}.zarr"})
     metadata["minimum_epoch_ipp_count"] = int(minimum_epoch_ipp_count)
     metadata["arc_entries"] = sorted(existing.values(), key=lambda e: (e["prn"], int(e["arc_index"])))
     _write_metadata(metadata_path, metadata)
@@ -254,7 +260,7 @@ def read_epoch_result(cache_dir: Path, *, prn: str, arc_index: int, epoch_index:
     group = zarr.open_group(str(cache_dir / f"{prn}_arc_{arc_index}.zarr"), mode="r")
     idx = int(epoch_index)
     payload = {
-        "prn": prn, "arc_index": int(arc_index), "epoch_index": int(group["epoch_index"][idx]), "time_h": float(group["time_h"][idx]),
+        "product_type": PRODUCT_TYPE_PER_PRN, "product_id": prn, "prn": prn, "arc_index": int(arc_index), "epoch_index": int(group["epoch_index"][idx]), "time_h": float(group["time_h"][idx]),
         "method": metadata["interpolation_method"], "projection": metadata["projection"], "grid_step_deg": float(metadata["grid_step_deg"]),
         "lon_values": group["lon_values"][:], "lat_values": group["lat_values"][:], "values": group["dtec_grid"][idx, :, :],
         "valid_mask": group["valid_mask"][idx, :, :], "point_count": int(group["point_count"][idx]), "station_count": int(group["station_count"][idx]),
@@ -373,3 +379,76 @@ def _decode(value: Any) -> str:
 
 def _copy_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in payload.items()}
+
+
+def ensure_combined_product(cache_dir: Path, *, expected_epoch_count: int, minimum_epoch_ipp_count: int) -> None:
+    metadata_path = cache_dir / "metadata.json"
+    metadata = _read_metadata(metadata_path)
+    types = set(metadata.get("product_types", [])); types.add(PRODUCT_TYPE_COMBINED_GPS); types.add(PRODUCT_TYPE_PER_PRN)
+    metadata["product_types"] = sorted(types)
+    metadata["minimum_epoch_ipp_count"] = int(minimum_epoch_ipp_count)
+    entries = [e for e in metadata.get("product_entries", []) if e.get("product_type") != PRODUCT_TYPE_COMBINED_GPS]
+    entries.append({"product_type": PRODUCT_TYPE_COMBINED_GPS, "product_id": COMBINED_GPS_PRODUCT_ID, "expected_epoch_count": int(expected_epoch_count), "stored_epoch_count": 0, "failed_epoch_count": 0, "status": "pending", "store_path": "products/combined_gps.zarr", "warning": COMBINED_GPS_WARNING})
+    metadata["product_entries"] = entries
+    metadata["updated_at"] = _now()
+    _write_metadata(metadata_path, metadata)
+
+
+def write_combined_epoch_result(cache_dir: Path, result: dict[str, Any]) -> None:
+    status = str(result["status"])
+    if status not in VALID_EPOCH_STATUSES:
+        raise ValueError(f"Invalid epoch status: {status}")
+    group = _open_combined_group(cache_dir, len(result["lat_values"]), len(result["lon_values"]), int(result["epoch_index"]))
+    idx = int(result["epoch_index"])
+    group["epoch_index"][idx] = idx; group["time_h"][idx] = float(result["time_h"])
+    group["lat_values"][:] = np.asarray(result["lat_values"], dtype=np.float64); group["lon_values"][:] = np.asarray(result["lon_values"], dtype=np.float64)
+    group["dtec_grid"][idx, :, :] = np.asarray(result["values"], dtype=np.float32); group["valid_mask"][idx, :, :] = np.asarray(result["valid_mask"], dtype=bool)
+    group["station_count"][idx] = int(result.get("station_count", 0)); group["prn_count"][idx] = int(result.get("prn_count", 0)); group["point_count"][idx] = int(result.get("point_count", 0)); group["raw_ipp_count"][idx] = int(result.get("raw_ipp_count", result.get("input_row_count", 0)))
+    group["status"][idx] = status; group["message"][idx] = str(result.get("message", "")); group["timings_json"][idx] = json.dumps(result.get("timings", {}), sort_keys=True)
+    _refresh_combined_metadata(cache_dir)
+
+
+def read_combined_epoch_result(cache_dir: Path, *, epoch_index: int) -> dict[str, Any]:
+    metadata = _read_metadata(cache_dir / "metadata.json")
+    validation = validate_interpolation_cache(cache_dir, product_types=metadata.get("product_types"))
+    if not validation.compatible:
+        raise RuntimeError(f"Interpolation cache is incompatible: {validation.reason}")
+    group = zarr.open_group(str(cache_dir / "products" / "combined_gps.zarr"), mode="r")
+    idx = int(epoch_index)
+    return {"product_type": PRODUCT_TYPE_COMBINED_GPS, "product_id": COMBINED_GPS_PRODUCT_ID, "prn": COMBINED_GPS_PRODUCT_ID, "epoch_index": int(group["epoch_index"][idx]), "time_h": float(group["time_h"][idx]), "method": metadata["interpolation_method"], "projection": metadata["projection"], "grid_step_deg": float(metadata["grid_step_deg"]), "lon_values": group["lon_values"][:], "lat_values": group["lat_values"][:], "values": group["dtec_grid"][idx, :, :], "valid_mask": group["valid_mask"][idx, :, :], "point_count": int(group["point_count"][idx]), "raw_ipp_count": int(group["raw_ipp_count"][idx]), "station_count": int(group["station_count"][idx]), "prn_count": int(group["prn_count"][idx]), "status": _decode(group["status"][idx]), "message": _decode(group["message"][idx]), "warning": COMBINED_GPS_WARNING, "timings": json.loads(_decode(group["timings_json"][idx]) or "{}")}
+
+
+def get_combined_epoch_status(cache_dir: Path, *, epoch_index: int) -> str | None:
+    path = cache_dir / "products" / "combined_gps.zarr"
+    if not path.exists(): return None
+    g = zarr.open_group(str(path), mode="r")
+    if epoch_index >= g["status"].shape[0]: return None
+    return _decode(g["status"][epoch_index])
+
+
+def _open_combined_group(cache_dir: Path, n_lat: int, n_lon: int, epoch_index: int):
+    path = cache_dir / "products" / "combined_gps.zarr"; path.parent.mkdir(parents=True, exist_ok=True)
+    group = zarr.open_group(str(path), mode="a"); n_epochs = max(epoch_index + 1, group["status"].shape[0] if "status" in group else 0)
+    compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+    def require(name, shape, dtype, chunks=None, fill_value=0):
+        if name in group:
+            arr = group[name]
+            if arr.shape[0] < shape[0]: arr.resize(shape)
+            return arr
+        return group.create_dataset(name, shape=shape, dtype=dtype, chunks=chunks or shape, fill_value=fill_value, compressor=compressor)
+    require("epoch_index", (n_epochs,), np.int64, (max(1, min(n_epochs, 1024)),), -1); require("time_h", (n_epochs,), np.float64, (max(1, min(n_epochs, 1024)),), np.nan)
+    require("lat_values", (n_lat,), np.float64, (n_lat,), 0.0); require("lon_values", (n_lon,), np.float64, (n_lon,), 0.0)
+    require("dtec_grid", (n_epochs, n_lat, n_lon), np.float32, (1, n_lat, n_lon), np.nan); require("valid_mask", (n_epochs, n_lat, n_lon), bool, (1, n_lat, n_lon), False)
+    require("station_count", (n_epochs,), np.int64, (max(1, min(n_epochs, 1024)),), 0); require("prn_count", (n_epochs,), np.int64, (max(1, min(n_epochs, 1024)),), 0); require("point_count", (n_epochs,), np.int64, (max(1, min(n_epochs, 1024)),), 0); require("raw_ipp_count", (n_epochs,), np.int64, (max(1, min(n_epochs, 1024)),), 0)
+    require("status", (n_epochs,), "U32", (max(1, min(n_epochs, 1024)),), "pending"); require("message", (n_epochs,), "U512", (max(1, min(n_epochs, 1024)),), ""); require("timings_json", (n_epochs,), "U2048", (max(1, min(n_epochs, 1024)),), "{}")
+    return group
+
+
+def _refresh_combined_metadata(cache_dir: Path) -> None:
+    metadata = _read_metadata(cache_dir / "metadata.json"); path = cache_dir / "products" / "combined_gps.zarr"
+    if not path.exists(): return
+    statuses = [_decode(x) for x in zarr.open_group(str(path), mode="r")["status"][:]]
+    for entry in metadata.get("product_entries", []):
+        if entry.get("product_type") == PRODUCT_TYPE_COMBINED_GPS:
+            entry["stored_epoch_count"] = sum(1 for s in statuses if s == "ready"); entry["failed_epoch_count"] = sum(1 for s in statuses if s in {"failed", "geometry_error", "insufficient_points"}); entry["status"] = "complete" if entry["stored_epoch_count"] + entry["failed_epoch_count"] >= int(entry.get("expected_epoch_count", 0)) else "partial"
+    metadata["updated_at"] = _now(); _write_metadata(cache_dir / "metadata.json", metadata)

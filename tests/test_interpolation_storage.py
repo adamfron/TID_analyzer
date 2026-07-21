@@ -176,3 +176,19 @@ def test_incompatible_resolution_namespace_is_not_silently_reused(tmp_path: Path
     write_epoch_result(half, _result(), arc_index=1)
     one = _cache(tmp_path, grid_step=1.0)
     assert not (one / "G24_arc_1.zarr").exists()
+
+
+def test_combined_product_has_dedicated_namespace_and_counts(tmp_path: Path) -> None:
+    from tid_analyzer.interpolation.storage import ensure_combined_product, write_combined_epoch_result, read_combined_epoch_result
+    cache_dir = _cache(tmp_path)
+    ensure_combined_product(cache_dir, expected_epoch_count=1, minimum_epoch_ipp_count=3)
+    result = _result().__dict__ | {"product_type":"combined_gps", "product_id":"GPS_ALL", "prn":"GPS_ALL", "raw_ipp_count":5, "station_count":3, "prn_count":2}
+    write_combined_epoch_result(cache_dir, result)
+    assert (cache_dir / "products" / "combined_gps.zarr").exists()
+    assert not (cache_dir / "GPS_ALL_arc_0.zarr").exists()
+    payload = read_combined_epoch_result(cache_dir, epoch_index=0)
+    assert payload["product_type"] == "combined_gps"
+    assert payload["product_id"] == "GPS_ALL"
+    assert payload["station_count"] == 3
+    assert payload["prn_count"] == 2
+    assert "Experimental combined field" in payload["warning"]
