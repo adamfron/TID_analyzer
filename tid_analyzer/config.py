@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+DEFAULT_MINIMUM_EPOCH_IPP_COUNT = 30
+
 
 @dataclass(frozen=True)
 class ImportFilters:

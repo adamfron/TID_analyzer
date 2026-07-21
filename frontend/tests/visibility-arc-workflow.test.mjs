@@ -1,0 +1,14 @@
+import { readFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
+const src = readFileSync(new URL('../src/main.tsx', import.meta.url), 'utf8');
+const api = readFileSync(new URL('../../tid_analyzer/api/app.py', import.meta.url), 'utf8');
+const config = readFileSync(new URL('../../tid_analyzer/config.py', import.meta.url), 'utf8');
+assert.ok(src.includes('const firstEpoch = String(a.start_time_h.toFixed(5));'), 'clicking an arc selects the literal first raw epoch');
+assert.ok(src.includes('Raw epoch available: ${visible.length} IPPs. Interpolation requires at least ${minimumEpochIppCount} IPPs.'), 'low-point epochs remain viewable with raw-epoch status');
+assert.ok(config.includes('DEFAULT_MINIMUM_EPOCH_IPP_COUNT = 30'), 'default interpolation threshold is 30 IPPs');
+assert.ok(src.includes('{a.generated_map_count || 0} / {(a.planned_interpolation_count ?? a.usable_epoch_count ?? a.epoch_count)}'), 'Maps uses ready/planned counts');
+assert.ok(src.indexOf('<VisibilityTable') < src.indexOf('Interpolate selected arc'), 'interpolation controls are below the table');
+assert.ok(src.includes('window.confirm(`This operation will generate ${planned} interpolated maps and may take a long time. Existing completed maps will be reused. Do you wish to continue?`)'), 'build-all displays a confirmation');
+assert.ok(src.includes('rasterToImage(r, mapDisplay.dtecRange)') && !api.includes('dtecRange'), 'changing display range only rerenders local image and does not modify backend data');
+assert.ok(src.includes('fill={dtecColor(p.dtec, display.dtecRange)}') && src.includes('const c=dtecRgb(v, dtecRange)'), 'raster and IPPs use the same linear colour function');
+console.log('visibility arc workflow source checks passed');

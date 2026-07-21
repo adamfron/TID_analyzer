@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import math
 
-from tid_analyzer.config import ImportFilters
+from tid_analyzer.config import DEFAULT_MINIMUM_EPOCH_IPP_COUNT, ImportFilters
 from tid_analyzer.importer.cache import connect_cache
 from tid_analyzer.interpolation.natural_neighbor import DEFAULT_GRID_STEP_DEG, METHOD, PROJECTION, interpolate_prn_epoch_natural_neighbor
 from tid_analyzer.interpolation.storage import (
@@ -48,10 +49,10 @@ class InterpolationController:
         self.status = update
         await self.queue.put(update)
 
-    async def start_build(self, *, daily_cache_path: Path, retry_failed: bool = False, force_rebuild: bool = False, prn: str | None = None, arc_index: int | None = None) -> dict[str, Any]:
+    async def start_build(self, *, daily_cache_path: Path, retry_failed: bool = False, force_rebuild: bool = False, prn: str | None = None, arc_index: int | None = None, minimum_epoch_ipp_count: int = DEFAULT_MINIMUM_EPOCH_IPP_COUNT) -> dict[str, Any]:
         if self.task and not self.task.done():
             raise RuntimeError("An interpolation build is already running")
-        plan = build_interpolation_plan(cache_root=self.cache_dir, daily_cache_path=daily_cache_path, retry_failed=retry_failed, force_rebuild=force_rebuild, prn=prn, arc_index=arc_index)
+        plan = build_interpolation_plan(cache_root=self.cache_dir, daily_cache_path=daily_cache_path, retry_failed=retry_failed, force_rebuild=force_rebuild, prn=prn, arc_index=arc_index, minimum_epoch_ipp_count=minimum_epoch_ipp_count)
         self.cancel_event.clear()
         started_at_utc = datetime.now(timezone.utc)
         started_monotonic = time.monotonic()
@@ -133,7 +134,7 @@ def _cache_dir_for_daily(cache_root: Path, daily_cache_path: Path) -> Path:
     return interpolation_cache_dir(cache_root, y, d, elev)
 
 
-def eligible_arcs_from_daily(daily_cache_path: Path, gap_minutes: float = 10.0, min_stations: int = 100, min_duration_min: float = 120.0) -> list[dict[str, Any]]:
+def eligible_arcs_from_daily(daily_cache_path: Path, gap_minutes: float = 10.0, min_stations: int = 100, min_duration_min: float = 120.0, minimum_epoch_ipp_count: int = DEFAULT_MINIMUM_EPOCH_IPP_COUNT) -> list[dict[str, Any]]:
     from tid_analyzer.api.app import _visibility_arc_from_epochs  # keep rules in one place
     gap_epochs = gap_minutes * 60 / 30
     arcs: list[dict[str, Any]] = []
@@ -149,16 +150,29 @@ def eligible_arcs_from_daily(daily_cache_path: Path, gap_minutes: float = 10.0, 
         starts = prev_prn is not None and prn != prev_prn
         gap = prev_epoch is not None and epoch_index - prev_epoch > gap_epochs
         if current and (starts or gap):
-            arcs.append(_visibility_arc_from_epochs(current[0][0], arc_index, current)); arc_index = 1 if starts else arc_index + 1; current=[]
+            arcs.append(_visibility_arc_from_epochs(current[0][0], arc_index, current, minimum_epoch_ipp_count)); arc_index = 1 if starts else arc_index + 1; current=[]
         current.append((prn, epoch_index, float(time_h), int(row_count), int(station_count), tuple(str(s) for s in (stations or []))))
         prev_prn=prn; prev_epoch=epoch_index
-    if current: arcs.append(_visibility_arc_from_epochs(current[0][0], arc_index, current))
+    if current: arcs.append(_visibility_arc_from_epochs(current[0][0], arc_index, current, minimum_epoch_ipp_count))
     return arcs
 
 
-def build_interpolation_plan(*, cache_root: Path, daily_cache_path: Path, retry_failed: bool = False, force_rebuild: bool = False, prn: str | None = None, arc_index: int | None = None) -> dict[str, Any]:
+
+def _has_three_unique_non_collinear_ipps(points: list[tuple[float, float]]) -> bool:
+    unique = sorted({(round(float(lon), 8), round(float(lat), 8)) for lon, lat in points if math.isfinite(float(lon)) and math.isfinite(float(lat))})
+    if len(unique) < 3:
+        return False
+    p0 = unique[0]
+    for i in range(1, len(unique) - 1):
+        for j in range(i + 1, len(unique)):
+            area = (unique[i][0] - p0[0]) * (unique[j][1] - p0[1]) - (unique[j][0] - p0[0]) * (unique[i][1] - p0[1])
+            if abs(area) > 1e-10:
+                return True
+    return False
+
+def build_interpolation_plan(*, cache_root: Path, daily_cache_path: Path, retry_failed: bool = False, force_rebuild: bool = False, prn: str | None = None, arc_index: int | None = None, minimum_epoch_ipp_count: int = DEFAULT_MINIMUM_EPOCH_IPP_COUNT) -> dict[str, Any]:
     year, doy, elev = _daily_metadata(daily_cache_path)
-    arcs = eligible_arcs_from_daily(daily_cache_path)
+    arcs = eligible_arcs_from_daily(daily_cache_path, minimum_epoch_ipp_count=minimum_epoch_ipp_count)
     eligible = [a for a in arcs if a.get("eligible_for_interpolation") is True]
     if prn is not None:
         eligible = [a for a in eligible if str(a.get("prn")) == prn and (arc_index is None or int(a.get("arc_index", -1)) == arc_index)]
@@ -166,14 +180,18 @@ def build_interpolation_plan(*, cache_root: Path, daily_cache_path: Path, retry_
     cache_dir = interpolation_cache_dir(cache_root, year, doy, elev)
     if force_rebuild and cache_dir.exists():
         shutil.rmtree(cache_dir)
-    cache_dir = create_or_open_interpolation_cache(cache_root=cache_root, daily_cache_path=daily_cache_path, year=year, doy=doy, minimum_elevation_deg=elev, arcs=descriptors)
+    cache_dir = create_or_open_interpolation_cache(cache_root=cache_root, daily_cache_path=daily_cache_path, year=year, doy=doy, minimum_elevation_deg=elev, arcs=descriptors, minimum_epoch_ipp_count=minimum_epoch_ipp_count)
     jobs_by_key: dict[tuple[str, int, int], InterpolationJob] = {}
     already_ready = skipped_existing = low_coverage_count = 0
     with connect_cache(daily_cache_path) as con:
         for arc in eligible:
-            rows = con.execute("SELECT epoch_index, AVG(time_h), COUNT(DISTINCT station) FROM observations WHERE prn = ? AND epoch_index BETWEEN ? AND ? GROUP BY epoch_index ORDER BY epoch_index", [arc["prn"], int(round(float(arc["start_time_h"])*120)), int(round(float(arc["end_time_h"])*120))]).fetchall()
-            for epoch_index, time_h, station_count in rows:
-                if int(station_count) < 100:
+            rows = con.execute("SELECT epoch_index, AVG(time_h), COUNT(*) FROM observations WHERE prn = ? AND epoch_index BETWEEN ? AND ? GROUP BY epoch_index ORDER BY epoch_index", [arc["prn"], int(round(float(arc["start_time_h"])*120)), int(round(float(arc["end_time_h"])*120))]).fetchall()
+            for epoch_index, time_h, ipp_count in rows:
+                if int(ipp_count) < minimum_epoch_ipp_count:
+                    low_coverage_count += 1
+                    continue
+                ipp_points = con.execute("SELECT DISTINCT ipp_lon, ipp_lat FROM observations WHERE prn = ? AND epoch_index = ? AND ipp_lon IS NOT NULL AND ipp_lat IS NOT NULL", [arc["prn"], int(epoch_index)]).fetchall()
+                if not _has_three_unique_non_collinear_ipps(ipp_points):
                     low_coverage_count += 1
                     continue
                 key = (str(arc["prn"]), int(arc["arc_index"]), int(epoch_index))
