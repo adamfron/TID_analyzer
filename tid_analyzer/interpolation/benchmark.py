@@ -7,7 +7,7 @@ import statistics
 import time
 from pathlib import Path
 
-from tid_analyzer.interpolation.natural_neighbor import LAT_BOUNDS, LON_BOUNDS, STAGE_NAMES
+from tid_analyzer.interpolation.natural_neighbor import LAT_BOUNDS, LON_BOUNDS, STAGE_NAMES, validate_grid_step
 from tid_analyzer.interpolation.orchestrator import InterpolationJob, _prepare_jobs_for_submission, _compute_prepared_job, _init_worker, _max_workers, eligible_arcs_from_daily
 
 
@@ -33,16 +33,17 @@ def _jobs(cache: Path, prn: str, epochs: int):
     return jobs
 
 
-def run(cache: Path, prn: str, epochs: int, matlab_scope: bool = False) -> None:
+def run(cache: Path, prn: str, epochs: int, matlab_scope: bool = False, grid_step: float = 1.0) -> None:
+    grid_step = validate_grid_step(grid_step)
     workers = _max_workers()
     jobs = _jobs(cache, prn, epochs)
     start = time.perf_counter(); results = []
     payloads = list(_prepare_jobs_for_submission(cache, jobs))
     if workers == 1:
-        _init_worker()
+        _init_worker(grid_step)
         pairs = [_compute_prepared_job(payload) for payload in payloads]
     else:
-        with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker) as pool:
+        with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(grid_step,)) as pool:
             pairs = list(pool.map(_compute_prepared_job, payloads))
     results = [result for result, _arc_index in pairs]
     wall = time.perf_counter() - start
@@ -53,6 +54,7 @@ def run(cache: Path, prn: str, epochs: int, matlab_scope: bool = False) -> None:
     per_map = [r.timings.get("total_epoch_time", 0.0) for r in results]
     print(f"worker count: {workers}")
     print(f"grid dimensions: {grid[0]} x {grid[1]}")
+    print(f"grid cell count: {grid[0] * grid[1]}")
     print(f"epoch count: {len(results)}")
     print(f"mean input points: {statistics.fmean([r.input_row_count for r in results]) if results else 0:.1f}")
     print(f"successful/skipped/failed: {successful}/{skipped}/{failed}")
@@ -74,8 +76,9 @@ def main() -> None:
     parser.add_argument("--prn", default="G24")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--matlab-scope", action="store_true")
+    parser.add_argument("--grid-step", type=float, default=1.0, choices=[0.5, 1.0])
     args = parser.parse_args()
-    run(args.cache, args.prn, args.epochs, args.matlab_scope)
+    run(args.cache, args.prn, args.epochs, args.matlab_scope, args.grid_step)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from tid_analyzer.interpolation.natural_neighbor import (
     LON_BOUNDS,
     METHOD,
     PROJECTION,
+    validate_grid_step,
     NaturalNeighborResult,
 )
 
@@ -75,9 +76,13 @@ class EpochGridLRU:
         return len(self._items)
 
 
-def interpolation_cache_dir(cache_root: Path, year: int, doy: int, minimum_elevation_deg: float) -> Path:
+def grid_cache_namespace(grid_step_deg: float) -> str:
+    step = validate_grid_step(grid_step_deg)
+    return f"grid_{str(step).replace('.', 'p')}"
+
+def interpolation_cache_dir(cache_root: Path, year: int, doy: int, minimum_elevation_deg: float, grid_step_deg: float = DEFAULT_GRID_STEP_DEG) -> Path:
     filters = ImportFilters(min_elevation_deg=minimum_elevation_deg)
-    return cache_path_for_day(cache_root, year, doy, filters).parent / "interpolation"
+    return cache_path_for_day(cache_root, year, doy, filters).parent / "interpolation" / grid_cache_namespace(grid_step_deg)
 
 
 def create_source_fingerprint(
@@ -136,7 +141,8 @@ def create_or_open_interpolation_cache(
     minimum_arc_duration_min: float = 0.0,
     minimum_epoch_ipp_count: int = 30,
 ) -> Path:
-    cache_dir = interpolation_cache_dir(cache_root, year, doy, minimum_elevation_deg)
+    grid_step_deg = validate_grid_step(grid_step_deg)
+    cache_dir = interpolation_cache_dir(cache_root, year, doy, minimum_elevation_deg, grid_step_deg)
     cache_dir.mkdir(parents=True, exist_ok=True)
     daily_cache_path = daily_cache_path or cache_path_for_day(cache_root, year, doy, ImportFilters(min_elevation_deg=minimum_elevation_deg))
     fingerprint = create_source_fingerprint(daily_cache_path=daily_cache_path, year=year, doy=doy, minimum_elevation_deg=minimum_elevation_deg, grid_step_deg=grid_step_deg, longitude_bounds=longitude_bounds, latitude_bounds=latitude_bounds, projection=projection, interpolation_method=interpolation_method)
