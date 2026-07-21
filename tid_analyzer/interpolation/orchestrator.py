@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import os
 import shutil
 import threading
@@ -12,15 +13,17 @@ from typing import Any
 
 import duckdb
 import math
+from time import perf_counter
 
 from tid_analyzer.config import DEFAULT_MINIMUM_EPOCH_IPP_COUNT, ImportFilters
 from tid_analyzer.importer.cache import connect_cache
-from tid_analyzer.interpolation.natural_neighbor import DEFAULT_GRID_STEP_DEG, METHOD, PROJECTION, interpolate_prn_epoch_natural_neighbor
+from tid_analyzer.interpolation.natural_neighbor import DEFAULT_GRID_STEP_DEG, METHOD, PROJECTION, GridGeometry, prepare_grid_geometry, interpolate_prn_epoch_natural_neighbor
 from tid_analyzer.interpolation.storage import (
     ArcDescriptor,
     create_or_open_interpolation_cache,
     interpolation_cache_dir,
     mark_cache_complete,
+    read_arc_statuses,
     write_epoch_result,
 )
 
@@ -74,25 +77,43 @@ class InterpolationController:
         cache_dir = _cache_dir_for_daily(self.cache_dir, daily_cache_path)
         try:
             await self.publish(_status("running", 0, total, generated, already_ready, skipped, failed, low_coverage, "Starting interpolation build", started_at_utc=started_at_utc, started_monotonic=started_monotonic))
-            sem = asyncio.Semaphore(self.max_workers)
-            for job in jobs:
-                if self.cancel_event.is_set():
-                    await self.publish(_status("cancelled", current, total, generated, already_ready, skipped, failed, low_coverage, "Interpolation build cancelled", started_at_utc=started_at_utc, started_monotonic=started_monotonic))
-                    return
-                current += 1
-                await self.publish(_status("running", current, total, generated, already_ready, skipped, failed, low_coverage, f"Interpolating {job.prn} arc {job.arc_index} epoch {job.epoch_index}", job, started_at_utc=started_at_utc, started_monotonic=started_monotonic))
-                async with sem:
-                    result = await asyncio.to_thread(_compute_job, daily_cache_path, job)
-                write_epoch_result(cache_dir, result, arc_index=job.arc_index)
-                if result.status == "ready":
-                    generated += 1
-                elif result.status == "insufficient_points":
-                    skipped += 1
-                else:
-                    failed += 1
-            if not self.cancel_event.is_set():
+            loop = asyncio.get_running_loop()
+            with ProcessPoolExecutor(max_workers=self.max_workers, initializer=_init_worker) as pool:
+                pending: dict[Any, InterpolationJob] = {}
+                job_iter = _prepare_jobs_for_submission(daily_cache_path, jobs)
+                def submit_until_full() -> None:
+                    nonlocal current
+                    while not self.cancel_event.is_set() and len(pending) < max(1, self.max_workers * 2):
+                        try:
+                            payload = next(job_iter)
+                        except StopIteration:
+                            return
+                        job = payload[0]
+                        pending[pool.submit(_compute_prepared_job, payload)] = job
+                        current += 1
+                submit_until_full()
+                while pending:
+                    done, _ = await loop.run_in_executor(None, lambda: wait(pending, return_when=FIRST_COMPLETED))
+                    for fut in done:
+                        job = pending.pop(fut)
+                        await self.publish(_status("running", current, total, generated, already_ready, skipped, failed, low_coverage, f"Writing {job.prn} arc {job.arc_index} epoch {job.epoch_index}", job, started_at_utc=started_at_utc, started_monotonic=started_monotonic))
+                        result, result_arc_index = fut.result()
+                        write_epoch_result(cache_dir, result, arc_index=result_arc_index)
+                        if result.status == "ready":
+                            generated += 1
+                        elif result.status == "insufficient_points":
+                            skipped += 1
+                        else:
+                            failed += 1
+                    if self.cancel_event.is_set():
+                        for fut in pending:
+                            fut.cancel()
+                    else:
+                        submit_until_full()
+            state = "cancelled" if self.cancel_event.is_set() else "completed"
+            if state == "completed":
                 mark_cache_complete(cache_dir)
-                await self.publish(_status("completed", total, total, generated, already_ready, skipped, failed, low_coverage, "Interpolation build completed", started_at_utc=started_at_utc, started_monotonic=started_monotonic))
+            await self.publish(_status(state, current if state == "cancelled" else total, total, generated, already_ready, skipped, failed, low_coverage, "Interpolation build cancelled" if state == "cancelled" else "Interpolation build completed", started_at_utc=started_at_utc, started_monotonic=started_monotonic))
         except Exception as exc:  # noqa: BLE001
             await self.publish(_status("error", current, total, generated, already_ready, skipped, failed, low_coverage, str(exc), started_at_utc=started_at_utc, started_monotonic=started_monotonic))
 
@@ -134,7 +155,7 @@ def _cache_dir_for_daily(cache_root: Path, daily_cache_path: Path) -> Path:
     return interpolation_cache_dir(cache_root, y, d, elev)
 
 
-def eligible_arcs_from_daily(daily_cache_path: Path, gap_minutes: float = 10.0, min_stations: int = 100, min_duration_min: float = 120.0, minimum_epoch_ipp_count: int = DEFAULT_MINIMUM_EPOCH_IPP_COUNT) -> list[dict[str, Any]]:
+def eligible_arcs_from_daily(daily_cache_path: Path, gap_minutes: float = 10.0, min_stations: int = 100, min_duration_min: float = 120.0, minimum_epoch_ipp_count: int = 100) -> list[dict[str, Any]]:
     from tid_analyzer.api.app import _visibility_arc_from_epochs  # keep rules in one place
     gap_epochs = gap_minutes * 60 / 30
     arcs: list[dict[str, Any]] = []
@@ -170,7 +191,7 @@ def _has_three_unique_non_collinear_ipps(points: list[tuple[float, float]]) -> b
                 return True
     return False
 
-def build_interpolation_plan(*, cache_root: Path, daily_cache_path: Path, retry_failed: bool = False, force_rebuild: bool = False, prn: str | None = None, arc_index: int | None = None, minimum_epoch_ipp_count: int = DEFAULT_MINIMUM_EPOCH_IPP_COUNT) -> dict[str, Any]:
+def build_interpolation_plan(*, cache_root: Path, daily_cache_path: Path, retry_failed: bool = False, force_rebuild: bool = False, prn: str | None = None, arc_index: int | None = None, minimum_epoch_ipp_count: int = 100) -> dict[str, Any]:
     year, doy, elev = _daily_metadata(daily_cache_path)
     arcs = eligible_arcs_from_daily(daily_cache_path, minimum_epoch_ipp_count=minimum_epoch_ipp_count)
     eligible = [a for a in arcs if a.get("eligible_for_interpolation") is True]
@@ -185,17 +206,14 @@ def build_interpolation_plan(*, cache_root: Path, daily_cache_path: Path, retry_
     already_ready = skipped_existing = low_coverage_count = 0
     with connect_cache(daily_cache_path) as con:
         for arc in eligible:
+            arc_statuses = read_arc_statuses(cache_dir, prn=str(arc["prn"]), arc_index=int(arc["arc_index"]))
             rows = con.execute("SELECT epoch_index, AVG(time_h), COUNT(*) FROM observations WHERE prn = ? AND epoch_index BETWEEN ? AND ? GROUP BY epoch_index ORDER BY epoch_index", [arc["prn"], int(round(float(arc["start_time_h"])*120)), int(round(float(arc["end_time_h"])*120))]).fetchall()
             for epoch_index, time_h, ipp_count in rows:
                 if int(ipp_count) < minimum_epoch_ipp_count:
                     low_coverage_count += 1
                     continue
-                ipp_points = con.execute("SELECT DISTINCT ipp_lon, ipp_lat FROM observations WHERE prn = ? AND epoch_index = ? AND ipp_lon IS NOT NULL AND ipp_lat IS NOT NULL", [arc["prn"], int(epoch_index)]).fetchall()
-                if not _has_three_unique_non_collinear_ipps(ipp_points):
-                    low_coverage_count += 1
-                    continue
                 key = (str(arc["prn"]), int(arc["arc_index"]), int(epoch_index))
-                status = get_epoch_status(cache_dir, prn=key[0], arc_index=key[1], epoch_index=key[2])
+                status = arc_statuses.get(key[2])
                 if status == "ready":
                     already_ready += 1; continue
                 if status == "insufficient_points" and not retry_failed:
@@ -222,3 +240,51 @@ def _compute_job(daily_cache_path: Path, job: InterpolationJob):
     data = [{"station": r[0], "ipp_lon": r[1], "ipp_lat": r[2], "dtec": r[3]} for r in rows]
     time_h = float(rows[0][4]) if rows else job.time_h
     return interpolate_prn_epoch_natural_neighbor(prn=job.prn, epoch_index=job.epoch_index, time_h=time_h, rows=data)
+
+_WORKER_GEOMETRY: GridGeometry | None = None
+
+
+def _init_worker() -> None:
+    global _WORKER_GEOMETRY
+    _WORKER_GEOMETRY = prepare_grid_geometry(DEFAULT_GRID_STEP_DEG)
+
+
+def _prepare_jobs_for_submission(daily_cache_path: Path, jobs: list[InterpolationJob], *, chunk_epochs: int = 64):
+    by_arc: dict[tuple[str, int], list[InterpolationJob]] = {}
+    for job in jobs:
+        by_arc.setdefault((job.prn, job.arc_index), []).append(job)
+    for (prn, _arc_index), arc_jobs in by_arc.items():
+        arc_jobs = sorted(arc_jobs, key=lambda j: j.epoch_index)
+        with duckdb.connect(str(daily_cache_path), read_only=True) as con:
+            for i in range(0, len(arc_jobs), chunk_epochs):
+                chunk = arc_jobs[i:i + chunk_epochs]
+                wanted = {j.epoch_index: j for j in chunk}
+                t0 = perf_counter()
+                rows = con.execute(
+                    """
+                    SELECT epoch_index, time_h, station, ipp_lon, ipp_lat, dtec
+                    FROM observations
+                    WHERE prn = ? AND epoch_index BETWEEN ? AND ?
+                    ORDER BY epoch_index, station
+                    """,
+                    [prn, min(wanted), max(wanted)],
+                ).fetchall()
+                query_seconds = perf_counter() - t0
+                grouped: dict[int, list[tuple[Any, float, float, float]]] = {epoch: [] for epoch in wanted}
+                times = {epoch: wanted[epoch].time_h for epoch in wanted}
+                for epoch_index, time_h, station, lon, lat, dtec in rows:
+                    epoch_index = int(epoch_index)
+                    if epoch_index in grouped:
+                        grouped[epoch_index].append((station, lon, lat, dtec))
+                        times[epoch_index] = float(time_h)
+                for job in chunk:
+                    yield job, times[job.epoch_index], grouped[job.epoch_index], query_seconds / max(1, len(chunk))
+
+
+def _compute_prepared_job(payload):
+    job, time_h, rows, database_query_seconds = payload
+    geometry = _WORKER_GEOMETRY or prepare_grid_geometry(DEFAULT_GRID_STEP_DEG)
+    data = [{"station": r[0], "ipp_lon": r[1], "ipp_lat": r[2], "dtec": r[3]} for r in rows]
+    result = interpolate_prn_epoch_natural_neighbor(prn=job.prn, epoch_index=job.epoch_index, time_h=time_h, rows=data, grid_geometry=geometry)
+    result.timings["database_query"] = float(database_query_seconds)
+    return result, job.arc_index
